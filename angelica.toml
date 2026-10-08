@@ -1,0 +1,16 @@
+manifest = 1
+
+[plugin]
+id = "harmonia"
+name = "Harmonia"
+version = "0.2.0"
+api = "1.0"
+description = "Shows the game in another language with community translation packs."
+authors = ["pokeda"]
+# A job holds a whole pack (up to 1 GiB by the format, about 125 MB in
+# practice) and the table built from it.
+memory_bytes = 1073741824
+
+[permissions]
+"excel.text" = true
+"text.case" = true
