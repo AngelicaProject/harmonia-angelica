@@ -4,21 +4,27 @@
 //! The player puts a pack into the plugin's `import` folder; a job verifies
 //! it completely (digest, signature, every record and string) and, after
 //! the player confirms the publisher, installs it. Choosing a translation
-//! builds its text table in a job. At the next game start Harmonia
-//! activates the table, so the host translates every row the game builds,
-//! and adds Cyrillic letters to the game's letter case when the
-//! translation is written in Cyrillic.
+//! builds its text table in a job, which also adds the pack's glyphs to the
+//! game's own font files. At the next game start Harmonia activates the
+//! table, so the host translates every row the game builds, has the host
+//! serve the patched font files instead of the game's, and adds Cyrillic
+//! letters to the game's letter case when the translation is written in
+//! Cyrillic.
 //!
 //! Like the Dalamud build, Harmonia changes translations only at game
 //! start: the game copies text into its own caches, so a change in the
 //! middle of a session would show a mix.
+pub mod atlas;
 pub mod compile;
+pub mod fdt;
+pub mod font_patch;
+pub mod fonts;
 pub mod library;
 pub mod pack;
 
 use angelica_sdk::{
     Plugin,
-    api::{excel_text, jobs, runtime, text_case},
+    api::{excel_text, file_replacements, game_files, jobs, runtime, text_case},
     ui::{Event, Tone, Window},
 };
 use library::{Settings, Stamp, Translation};
@@ -66,6 +72,8 @@ struct Harmonia {
     message: (String, Tone),
     status: Option<excel_text::TableStatus>,
     since_status: f64,
+    /// Font files served in this session.
+    fonts: usize,
 }
 
 fn short(fingerprint: &str) -> String {
@@ -100,8 +108,14 @@ impl Harmonia {
     }
 
     /// Whether the table of `hash` was built with the current settings.
+    /// Whether the table of `hash` was built with the current settings and
+    /// its fonts from the running game's files.
     fn table_is_current(&self, hash: &str) -> bool {
-        matches!(library::load_stamp(hash), Ok(Some(stamp)) if stamp.kept_sheets == self.settings.kept_sheets)
+        matches!(
+            library::load_stamp(hash),
+            Ok(Some(stamp)) if stamp.kept_sheets == self.settings.kept_sheets
+                && stamp.game_version == runtime::game_version()
+        )
     }
 
     /// Applies the chosen translation at game start.
@@ -126,6 +140,9 @@ impl Harmonia {
             ),
             Tone::Good,
         );
+        if let Ok(Some(stamp)) = library::load_stamp(hash) {
+            self.replace_fonts(&stamp);
+        }
         if compile::is_cyrillic(&translation.language) {
             let letters: Vec<_> = compile::cyrillic_letters()
                 .into_iter()
@@ -139,6 +156,26 @@ impl Harmonia {
             }
         }
         Ok(())
+    }
+
+    /// Serves the translation's font files; a failure leaves the game's own
+    /// fonts and is reported.
+    fn replace_fonts(&mut self, stamp: &Stamp) {
+        let mut failed = Vec::new();
+        for (game_path, storage_path) in &stamp.fonts {
+            if let Err(error) = file_replacements::replace(game_path, storage_path) {
+                failed.push(format!("{game_path}: {}", error.message));
+            }
+        }
+        self.fonts = if failed.is_empty() {
+            stamp.fonts.len()
+        } else {
+            self.say(
+                format!("The game's own fonts stay: {}", failed.join("; ")),
+                Tone::Warning,
+            );
+            0
+        };
     }
 
     fn start_job(&mut self, name: &str, input: &impl Serialize, job: Job) {
@@ -341,6 +378,12 @@ impl Harmonia {
                 );
             }
         }
+        if self.applied.is_some() && self.fonts > 0 {
+            window = window.muted(format!(
+                "Fonts: {} game font files with the translation's glyphs.",
+                self.fonts
+            ));
+        }
         if self.applied != self.settings.active {
             window = window.toned(
                 match chosen {
@@ -377,6 +420,7 @@ impl Plugin for Harmonia {
             message: (String::new(), Tone::Muted),
             status: None,
             since_status: f64::INFINITY,
+            fonts: 0,
         };
         if plugin.started_with_game
             && let Some(hash) = plugin.settings.active.clone()
@@ -550,6 +594,8 @@ impl Plugin for Harmonia {
                 }
                 let _ = jobs::report(0.6, "Preparing the translation");
                 let (table, summary) = compile::compile(&pack, &input.kept_sheets)?;
+                let _ = jobs::report(0.8, "Preparing fonts");
+                let (fonts, font_reports) = prepare_fonts(&pack, &input.hash)?;
                 let _ = jobs::report(0.9, "Saving");
                 angelica_sdk::api::storage::write(&library::table_path(&input.hash), &table)
                     .map_err(|e| e.message)?;
@@ -557,6 +603,9 @@ impl Plugin for Harmonia {
                     hash: input.hash,
                     kept_sheets: input.kept_sheets,
                     summary,
+                    game_version: runtime::game_version(),
+                    fonts,
+                    font_reports,
                 };
                 library::save_stamp(&stamp)?;
                 serde_json::to_vec(&stamp)
@@ -565,6 +614,43 @@ impl Plugin for Harmonia {
         };
         output.map_err(|e| e.to_string())
     }
+}
+
+/// Patches the game's font files with the pack's glyphs and saves the
+/// changed files in storage.
+/// Patched font files, as game path and storage path, and a report per
+/// target.
+type PreparedFonts = (Vec<(String, String)>, Vec<font_patch::Report>);
+
+fn prepare_fonts(pack: &pack::Pack<'_>, hash: &str) -> Result<PreparedFonts, String> {
+    if pack.fonts.is_none() && pack.font_replacements.is_none() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut failure = None;
+    let mut read = |path: &str| match game_files::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            if error.kind != angelica_sdk::ErrorKind::NotFound {
+                failure = Some(format!("{path}: {}", error.message));
+            }
+            None
+        }
+    };
+    let patched = font_patch::patch(
+        pack.fonts.as_ref(),
+        pack.font_replacements.as_ref(),
+        &mut read,
+    )?;
+    if let Some(failure) = failure {
+        return Err(failure);
+    }
+    let mut files = Vec::new();
+    for (game_path, contents) in &patched.files {
+        let storage_path = library::font_path(hash, game_path);
+        angelica_sdk::api::storage::write(&storage_path, contents).map_err(|e| e.message)?;
+        files.push((game_path.clone(), storage_path));
+    }
+    Ok((files, patched.reports))
 }
 
 /// Verifies a pack completely and describes it.

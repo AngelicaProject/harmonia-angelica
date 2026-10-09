@@ -29,6 +29,8 @@ const KIND_ROWS: u32 = 5;
 const KIND_CELLS: u32 = 6;
 const KIND_STRINGS: u32 = 7;
 const FIRST_OPTIONAL: u32 = 0x10000;
+const KIND_FONTS: u32 = 0x10000;
+const KIND_FONT_REPLACEMENTS: u32 = 0x10001;
 
 /// The domain of the packs' source guards; it keeps its historical spelling.
 pub const GUARD_DOMAIN: &[u8] = b"HARMONIA-HXS-V1-RAW-STRING";
@@ -138,6 +140,10 @@ pub struct Pack<'a> {
     pub hash: [u8; 32],
     pub manifest: Manifest,
     pub signature: Option<Signature>,
+    /// Glyphs added to the game's fonts (format minor 1).
+    pub fonts: Option<crate::fonts::Fonts>,
+    /// Glyphs that replace the game's own (format minor 2).
+    pub font_replacements: Option<crate::fonts::Fonts>,
     names: &'a [u8],
     sheets: &'a [u8],
     layout: &'a [u8],
@@ -233,11 +239,22 @@ impl<'a> Pack<'a> {
                 fail(format!("section {name} has an invalid length"))
             }
         };
+        let fonts = |kind: u32, name: &str| -> Result<Option<crate::fonts::Fonts>, Error> {
+            sections
+                .get(&kind)
+                .map(|&(offset, length)| {
+                    crate::fonts::Fonts::parse(&bytes[offset..offset + length])
+                        .map_err(|e| Error(format!("{name}: {}", e.0)))
+                })
+                .transpose()
+        };
         let pack = Self {
             bytes,
             hash,
             manifest,
             signature,
+            fonts: fonts(KIND_FONTS, "FONTS")?,
+            font_replacements: fonts(KIND_FONT_REPLACEMENTS, "font replacements")?,
             names: section(KIND_NAMES)?,
             sheets: section(KIND_SHEETS)?,
             layout: section(KIND_LAYOUT)?,
@@ -689,6 +706,34 @@ mod tests {
     const FONTS: &[u8] = include_bytes!("../../Harmonia.Tests/TestData/harmonia-interop-fonts.hpk");
     const REPLACEMENTS: &[u8] =
         include_bytes!("../../Harmonia.Tests/TestData/harmonia-interop-replacements.hpk");
+
+    #[test]
+    fn reads_the_font_sections() {
+        assert!(Pack::parse(INTEROP).unwrap().fonts.is_none());
+        let fonts = Pack::parse(FONTS).unwrap();
+        let section = fonts.fonts.as_ref().unwrap();
+        assert_eq!(section.sources[0].family, "Test Sans");
+        assert!(
+            section
+                .targets
+                .iter()
+                .all(|target| !target.glyphs.is_empty())
+        );
+        assert!(fonts.font_replacements.is_none());
+        let replacements = Pack::parse(REPLACEMENTS).unwrap();
+        assert!(replacements.fonts.is_some() && replacements.font_replacements.is_some());
+        let target = &replacements.font_replacements.as_ref().unwrap().targets[0];
+        let glyph = &target.glyphs[0];
+        assert_eq!(
+            replacements
+                .font_replacements
+                .as_ref()
+                .unwrap()
+                .bitmap(glyph)
+                .len(),
+            usize::from(glyph.width) * usize::from(glyph.height)
+        );
+    }
 
     #[test]
     fn reads_the_packs_aeria_writes() {

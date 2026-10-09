@@ -22,6 +22,7 @@ sha2 = "0.10.9"
 [dev-dependencies]
 angelica-fake-game = { path = "../angelica/crates/angelica-fake-game" }
 angelica-host = { path = "../angelica/crates/angelica-host" }
+angelica-sqpack = { path = "../angelica/crates/angelica-sqpack" }
 angelica-text = { path = "../angelica/crates/angelica-text" }
 
 [lints.rust]

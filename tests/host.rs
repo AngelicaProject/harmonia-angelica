@@ -268,3 +268,88 @@ fn a_real_pack_compiles_within_the_job_limits() {
         texts(&test)
     );
 }
+
+/// The game's font files for the targets of the Aeria fonts pack: a table
+/// with matching metrics and seven empty textures per set.
+fn font_game(pack: &[u8]) -> angelica_fake_game::game_files::FakeGame {
+    let pack = harmonia::pack::Pack::parse(pack).unwrap();
+    let mut game = angelica_fake_game::game_files::FakeGame::new("2026.09.15.0000.0000");
+    let sections = [pack.fonts.as_ref(), pack.font_replacements.as_ref()];
+    for suffix in ["", "_lobby"] {
+        for target in sections.iter().flatten().flat_map(|fonts| &fonts.targets) {
+            let mut table = b"fcsv0100".to_vec();
+            table.extend_from_slice(&0x20u32.to_le_bytes());
+            table.extend_from_slice(&0x40u32.to_le_bytes());
+            table.resize(0x20, 0);
+            table.extend_from_slice(b"fthd");
+            table.extend_from_slice(&[0; 12]);
+            table.extend_from_slice(&256u16.to_le_bytes());
+            table.extend_from_slice(&256u16.to_le_bytes());
+            table.extend_from_slice(&12f32.to_le_bytes());
+            table.extend_from_slice(&i32::from(target.line_height).to_le_bytes());
+            table.extend_from_slice(&i32::from(target.ascent).to_le_bytes());
+            table.extend_from_slice(b"knhd");
+            table.extend_from_slice(&[0; 12]);
+            game = game.with_file(format!("common/font/{}{suffix}.fdt", target.name()), table);
+        }
+        let prefix = if suffix.is_empty() {
+            "font"
+        } else {
+            "font_lobby"
+        };
+        for number in 1..=7 {
+            let mut texture = vec![0u8; 80 + 256 * 256 * 2];
+            texture[4..8].copy_from_slice(&0x1440u32.to_le_bytes());
+            texture[8..10].copy_from_slice(&256u16.to_le_bytes());
+            texture[10..12].copy_from_slice(&256u16.to_le_bytes());
+            texture[28..32].copy_from_slice(&80u32.to_le_bytes());
+            game = game.with_file(format!("common/font/{prefix}{number}.tex"), texture);
+        }
+    }
+    game
+}
+
+#[test]
+fn a_pack_with_fonts_replaces_the_games_font_files_at_the_next_start() {
+    const FONTS: &str = "../Harmonia.Tests/TestData/harmonia-interop-fonts.hpk";
+    let pack = std::fs::read(FONTS).unwrap();
+    let mut test = TestHost::new(Limits::default());
+    font_game(&pack).write(&test.game_folder()).unwrap();
+    let import = test.folder.path().join("storage/harmonia/import");
+    std::fs::create_dir_all(&import).unwrap();
+    std::fs::write(import.join("fonts.hpk"), &pack).unwrap();
+    start(&mut test);
+    click(&test, "check-0");
+    wait(&test);
+    click(&test, "install");
+    wait(&test);
+    click(&test, "use-0");
+    wait(&test);
+    assert!(
+        texts(&test).iter().any(|t| t.starts_with("Ready")),
+        "{:?}",
+        texts(&test)
+    );
+
+    let folder = test.folder;
+    let mut test = TestHost::in_folder(folder, Limits::default());
+    start(&mut test);
+    let shown = texts(&test);
+    assert!(shown.iter().any(|t| t.starts_with("Fonts: ")), "{shown:?}");
+    let target = harmonia::pack::Pack::parse(&pack)
+        .unwrap()
+        .fonts
+        .unwrap()
+        .targets[0]
+        .name();
+    assert!(
+        test.services()
+            .files
+            .lookup(
+                format!("common/font/{target}.fdt")
+                    .to_lowercase()
+                    .as_bytes()
+            )
+            .is_some()
+    );
+}

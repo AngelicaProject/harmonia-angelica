@@ -45,6 +45,12 @@ pub fn pack_path(hash: &str) -> String {
     format!("packs/{hash}.hpk")
 }
 
+/// Where a patched game file of a translation is kept.
+#[must_use]
+pub fn font_path(hash: &str, game_path: &str) -> String {
+    format!("fonts/{hash}/{game_path}")
+}
+
 #[must_use]
 pub fn table_path(hash: &str) -> String {
     format!("tables/{hash}.table")
@@ -70,6 +76,11 @@ pub struct Stamp {
     pub hash: String,
     pub kept_sheets: Vec<String>,
     pub summary: crate::compile::Summary,
+    /// The game build the font files were made from.
+    pub game_version: String,
+    /// Patched game font files: game path and storage path.
+    pub fonts: Vec<(String, String)>,
+    pub font_reports: Vec<crate::font_patch::Report>,
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<Option<T>, String> {
@@ -123,8 +134,13 @@ pub fn save_stamp(stamp: &Stamp) -> Result<(), String> {
     write_json(&stamp_path(&stamp.hash), stamp)
 }
 
-/// Removes a translation's pack and table.
+/// Removes a translation's pack, table, and font files.
 pub fn remove_files(hash: &str) {
+    if let Ok(Some(stamp)) = load_stamp(hash) {
+        for (_, path) in &stamp.fonts {
+            let _ = storage::remove(path);
+        }
+    }
     for path in [pack_path(hash), table_path(hash), stamp_path(hash)] {
         let _ = storage::remove(&path);
     }
