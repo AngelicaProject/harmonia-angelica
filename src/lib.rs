@@ -157,6 +157,15 @@ fn megabytes(bytes: u64) -> String {
     format!("{value:.1} MB")
 }
 
+/// `en` or `ru`, by the language of Angelica's interface now.
+pub(crate) fn words(en: impl Into<String>, ru: impl Into<String>) -> String {
+    if runtime::language() == "ru" {
+        ru.into()
+    } else {
+        en.into()
+    }
+}
+
 impl Harmonia {
     fn say(&mut self, text: impl Into<String>, tone: Tone) {
         self.message = (text.into(), tone);
@@ -184,23 +193,32 @@ impl Harmonia {
 
     /// Applies the chosen translation at game start.
     fn apply(&mut self, hash: &str) -> Result<(), String> {
-        let translation = self
-            .translation(hash)
-            .cloned()
-            .ok_or("the chosen translation is no longer installed")?;
+        let translation = self.translation(hash).cloned().ok_or_else(|| {
+            words(
+                "the chosen translation is no longer installed",
+                "выбранный перевод больше не установлен",
+            )
+        })?;
         if !self.table_is_current(hash) {
             self.compile(hash);
-            return Err(
-                "the translation is being prepared; it applies at the next game start".into(),
-            );
+            return Err(words(
+                "the translation is being prepared; it applies at the next game start",
+                "перевод готовится; он применится при следующем запуске игры",
+            ));
         }
         let info =
             excel_text::activate(TABLE, &library::table_path(hash), 0).map_err(|e| e.message)?;
         self.applied = Some(hash.to_owned());
         self.say(
-            format!(
-                "{} {}: {} cells in {} sheets ready; the game translates them as it loads its text.",
-                translation.title, translation.version, info.cells, info.sheets
+            words(
+                format!(
+                    "{} {}: {} cells in {} sheets ready; the game translates them as it loads its text.",
+                    translation.title, translation.version, info.cells, info.sheets
+                ),
+                format!(
+                    "{} {}: готово ячеек: {}, листов: {}; игра переводит их, когда загружает текст.",
+                    translation.title, translation.version, info.cells, info.sheets
+                ),
             ),
             Tone::Good,
         );
@@ -214,7 +232,10 @@ impl Harmonia {
                 .collect();
             if let Err(error) = text_case::set_letters(&letters) {
                 self.say(
-                    format!("Capital letters stay lowercase: {}", error.message),
+                    words(
+                        format!("Capital letters stay lowercase: {}", error.message),
+                        format!("Заглавные буквы останутся строчными: {}", error.message),
+                    ),
                     Tone::Warning,
                 );
             }
@@ -235,7 +256,10 @@ impl Harmonia {
             stamp.fonts.len()
         } else {
             self.say(
-                format!("The game's own fonts stay: {}", failed.join("; ")),
+                words(
+                    format!("The game's own fonts stay: {}", failed.join("; ")),
+                    format!("Остаются шрифты игры: {}", failed.join("; ")),
+                ),
                 Tone::Warning,
             );
             0
@@ -244,7 +268,13 @@ impl Harmonia {
 
     fn start_job(&mut self, name: &str, input: &impl Serialize, job: Job) {
         if self.job.is_some() {
-            self.say("Wait for the running task to finish.", Tone::Warning);
+            self.say(
+                words(
+                    "Wait for the running task to finish.",
+                    "Дождитесь конца текущей задачи.",
+                ),
+                Tone::Warning,
+            );
             return;
         }
         let input = match serde_json::to_vec(input) {
@@ -256,7 +286,13 @@ impl Harmonia {
                 self.job = Some((id, job));
                 self.progress = (0.0, String::new());
             }
-            Err(error) => self.say(format!("Cannot start: {}", error.message), Tone::Bad),
+            Err(error) => self.say(
+                words(
+                    format!("Cannot start: {}", error.message),
+                    format!("Не удалось начать: {}", error.message),
+                ),
+                Tone::Bad,
+            ),
         }
     }
 
@@ -272,7 +308,13 @@ impl Harmonia {
         let result = library::save_library(&self.library)
             .and_then(|()| library::save_settings(&self.settings));
         if let Err(error) = result {
-            self.say(format!("Cannot save: {error}"), Tone::Bad);
+            self.say(
+                words(
+                    format!("Cannot save: {error}"),
+                    format!("Не удалось сохранить: {error}"),
+                ),
+                Tone::Bad,
+            );
         }
     }
 
@@ -282,7 +324,13 @@ impl Harmonia {
                 let inspection: Inspection =
                     serde_json::from_slice(output).map_err(|e| e.to_string())?;
                 if self.translation(&inspection.translation.hash).is_some() {
-                    self.say("This pack is already installed.", Tone::Muted);
+                    self.say(
+                        words(
+                            "This pack is already installed.",
+                            "Этот пак уже установлен.",
+                        ),
+                        Tone::Muted,
+                    );
                 } else {
                     self.inspection = Some(inspection);
                 }
@@ -291,7 +339,10 @@ impl Harmonia {
                 let translation: Translation =
                     serde_json::from_slice(output).map_err(|e| e.to_string())?;
                 self.say(
-                    format!("Installed {} {}.", translation.title, translation.version),
+                    words(
+                        format!("Installed {} {}.", translation.title, translation.version),
+                        format!("Установлен {} {}.", translation.title, translation.version),
+                    ),
                     Tone::Good,
                 );
                 self.installed(translation);
@@ -313,22 +364,40 @@ impl Harmonia {
                 let ready = if self.applied.as_deref() == Some(hash.as_str())
                     && self.settings.active.as_deref() == Some(&hash)
                 {
-                    "Prepared again; the change applies at the next game start."
+                    words(
+                        "Prepared again; the change applies at the next game start.",
+                        "Подготовлено заново; изменение применится при следующем запуске игры.",
+                    )
                 } else {
-                    "Ready; it applies at the next game start."
+                    words(
+                        "Ready; it applies at the next game start.",
+                        "Готово; применится при следующем запуске игры.",
+                    )
                 };
                 let reserved = if stamp.summary.reserved > 0 {
-                    format!(
-                        " {} cells hold reserved game tokens and are not written.",
-                        stamp.summary.reserved
+                    words(
+                        format!(
+                            " {} cells hold reserved game tokens and are not written.",
+                            stamp.summary.reserved
+                        ),
+                        format!(
+                            " Не записаны ячейки с зарезервированными знаками игры: {}.",
+                            stamp.summary.reserved
+                        ),
                     )
                 } else {
                     String::new()
                 };
                 self.say(
-                    format!(
-                        "{ready} {} cells in {} sheets.{reserved}",
-                        stamp.summary.cells, stamp.summary.sheets
+                    words(
+                        format!(
+                            "{ready} {} cells in {} sheets.{reserved}",
+                            stamp.summary.cells, stamp.summary.sheets
+                        ),
+                        format!(
+                            "{ready} Ячеек: {}, листов: {}.{reserved}",
+                            stamp.summary.cells, stamp.summary.sheets
+                        ),
                     ),
                     Tone::Good,
                 );
@@ -400,7 +469,12 @@ impl Harmonia {
             return;
         }
         let Some(release) = release else {
-            let reason = error.unwrap_or_else(|| "The feed has no stable release.".into());
+            let reason = error.unwrap_or_else(|| {
+                words(
+                    "The feed has no stable release.",
+                    "В ленте нет стабильного выпуска.",
+                )
+            });
             return self.set_feed(&url, title, FeedStatus::Problem(reason));
         };
         // A pack the player imported by hand is the feed's release.
@@ -419,14 +493,23 @@ impl Harmonia {
             .map(|t| t.version.as_str())
             .max();
         let status = if compile::game_language(&release.game_language).is_none() {
-            FeedStatus::Problem(format!(
-                "The release is made for the game language {}, which the game does not have.",
-                release.game_language
+            FeedStatus::Problem(words(
+                format!(
+                    "The release is made for the game language {}, which the game does not have.",
+                    release.game_language
+                ),
+                format!(
+                    "Выпуск сделан для языка игры {}, которого в игре нет.",
+                    release.game_language
+                ),
             ))
         } else if !release.is_newer_than(installed) {
             FeedStatus::UpToDate
         } else if !release.supported_by(env!("CARGO_PKG_VERSION")) {
-            FeedStatus::Problem("The newest release needs a newer Harmonia.".into())
+            FeedStatus::Problem(words(
+                "The newest release needs a newer Harmonia.",
+                "Новому выпуску нужна более новая Harmonia.",
+            ))
         } else {
             if installed.is_some() {
                 self.request(&url, &release);
@@ -452,7 +535,13 @@ impl Harmonia {
         let translation = &inspection.translation;
         if self.translation(&translation.hash).is_some() {
             let _ = storage::remove(&inspection.path);
-            return self.say("This pack is already installed.", Tone::Muted);
+            return self.say(
+                words(
+                    "This pack is already installed.",
+                    "Этот пак уже установлен.",
+                ),
+                Tone::Muted,
+            );
         }
         let trusted = translation.key.is_some()
             && self
@@ -468,9 +557,15 @@ impl Harmonia {
             self.start_job("install", &input, Job::Install);
         } else {
             self.say(
-                format!(
-                    "{} {} is downloaded and waits for your decision in Harmonia.",
-                    translation.title, translation.version
+                words(
+                    format!(
+                        "{} {} is downloaded and waits for your decision in Harmonia.",
+                        translation.title, translation.version
+                    ),
+                    format!(
+                        "{} {} скачан и ждёт вашего решения в Harmonia.",
+                        translation.title, translation.version
+                    ),
                 ),
                 Tone::Warning,
             );
@@ -482,12 +577,18 @@ impl Harmonia {
         let url = self.feed_input.trim().to_owned();
         if !feed::is_link(&url) {
             return self.say(
-                "This does not look like a link. It must start with https://",
+                words(
+                    "This does not look like a link. It must start with https://",
+                    "Это не похоже на ссылку. Она должна начинаться с https://",
+                ),
                 Tone::Warning,
             );
         }
         if self.settings.feeds.contains(&url) {
-            return self.say("This link is already added.", Tone::Muted);
+            return self.say(
+                words("This link is already added.", "Эта ссылка уже добавлена."),
+                Tone::Muted,
+            );
         }
         self.settings.feeds.push(url);
         self.feed_input.clear();
@@ -563,7 +664,13 @@ impl Harmonia {
                 self.settings.active = Some(hash.clone());
                 self.save();
                 if self.table_is_current(&hash) {
-                    self.say("Applies at the next game start.", Tone::Normal);
+                    self.say(
+                        words(
+                            "Applies at the next game start.",
+                            "Применится при следующем запуске игры.",
+                        ),
+                        Tone::Normal,
+                    );
                 } else {
                     self.compile(&hash);
                 }
@@ -581,7 +688,13 @@ impl Harmonia {
                     library::remove_files(&removed.hash);
                 }
                 self.save();
-                self.say(format!("Removed {}.", removed.title), Tone::Normal);
+                self.say(
+                    words(
+                        format!("Removed {}.", removed.title),
+                        format!("Удалён {}.", removed.title),
+                    ),
+                    Tone::Normal,
+                );
             }
         } else {
             match id {
@@ -589,14 +702,23 @@ impl Harmonia {
                     self.settings.active = None;
                     self.save();
                     self.say(
-                        "The game stays untranslated from the next start.",
+                        words(
+                            "The game stays untranslated from the next start.",
+                            "Со следующего запуска игра будет без перевода.",
+                        ),
                         Tone::Normal,
                     );
                 }
                 "refresh" => self.imports = library::imports(),
                 "install" => {
                     if self.job.is_some() {
-                        self.say("Wait for the running task to finish.", Tone::Warning);
+                        self.say(
+                            words(
+                                "Wait for the running task to finish.",
+                                "Дождитесь конца текущей задачи.",
+                            ),
+                            Tone::Warning,
+                        );
                     } else if let Some(inspection) = self.inspection.take() {
                         let input = InstallInput {
                             path: inspection.path,
@@ -632,8 +754,14 @@ impl Harmonia {
         }
         if self.applied != self.settings.active {
             let text = match name(&self.settings.active) {
-                Some(chosen) => format!("{chosen} — at the next game start"),
-                None => "No translation from the next game start".into(),
+                Some(chosen) => words(
+                    format!("{chosen} — at the next game start"),
+                    format!("{chosen} — со следующего запуска игры"),
+                ),
+                None => words(
+                    "No translation from the next game start",
+                    "Без перевода со следующего запуска игры",
+                ),
             };
             return Some((text, Tone::Warning));
         }
@@ -1028,7 +1156,10 @@ impl Plugin for Harmonia {
                 && let Err(reason) = plugin.apply(&hash)
             {
                 plugin.say(
-                    format!("No translation in this session: {reason}"),
+                    words(
+                        format!("No translation in this session: {reason}"),
+                        format!("В этой игре без перевода: {reason}"),
+                    ),
                     Tone::Warning,
                 );
             }
@@ -1177,7 +1308,10 @@ impl Plugin for Harmonia {
                     serde_json::from_slice(&input).map_err(|e| e.to_string())?;
                 let inspection = inspect(&input.path)?;
                 if inspection.translation.hash != input.hash {
-                    return Err("the file changed after it was checked; check it again".into());
+                    return Err(words(
+                        "the file changed after it was checked; check it again",
+                        "файл изменился после проверки; проверьте его ещё раз",
+                    ));
                 }
                 storage::rename(&input.path, &inspection.translation.pack_path())
                     .map_err(|e| e.message)?;
@@ -1200,16 +1334,22 @@ impl Plugin for Harmonia {
                 let input: CompileInput =
                     serde_json::from_slice(&input).map_err(|e| e.to_string())?;
                 let bytes = library::read_file(&library::pack_path(&input.hash), pack::MAX_PACK)?;
-                let _ = jobs::report(0.4, "Checking the pack");
+                let _ = jobs::report(0.4, &words("Checking the pack", "Проверка пака"));
                 let pack = pack::Pack::parse(&bytes).map_err(|e| e.0)?;
                 if pack.hash_hex() != input.hash {
-                    return Err("the installed pack changed; install it again".into());
+                    return Err(words(
+                        "the installed pack changed; install it again",
+                        "установленный пак изменился; установите его ещё раз",
+                    ));
                 }
-                let _ = jobs::report(0.6, "Preparing the translation");
+                let _ = jobs::report(
+                    0.6,
+                    &words("Preparing the translation", "Подготовка перевода"),
+                );
                 let (table, summary) = compile::compile(&pack, &input.kept_sheets)?;
-                let _ = jobs::report(0.8, "Preparing fonts");
+                let _ = jobs::report(0.8, &words("Preparing fonts", "Подготовка шрифтов"));
                 let (fonts, font_reports) = prepare_fonts(&pack, &input.hash)?;
-                let _ = jobs::report(0.9, "Saving");
+                let _ = jobs::report(0.9, &words("Saving", "Сохранение"));
                 storage::write(&library::table_path(&input.hash), &table).map_err(|e| e.message)?;
                 let stamp = Stamp {
                     hash: input.hash,
@@ -1268,7 +1408,12 @@ fn prepare_fonts(pack: &pack::Pack<'_>, hash: &str) -> Result<PreparedFonts, Str
 /// Reads a feed and picks its newest release.
 fn check_feed(url: String) -> Checked {
     let feed = http::get(&url)
-        .map_err(|error| format!("The feed could not be read: {}", error.message))
+        .map_err(|error| {
+            words(
+                format!("The feed could not be read: {}", error.message),
+                format!("Не удалось прочитать ленту: {}", error.message),
+            )
+        })
         .and_then(|response| match response.head.status {
             200..=299 => feed::parse(&response.body).map_err(|reason| {
                 let mut reason = reason;
@@ -1277,8 +1422,14 @@ fn check_feed(url: String) -> Checked {
                 }
                 format!("{reason}.")
             }),
-            404 | 410 => Err("Nothing is published at this link.".into()),
-            status => Err(format!("The server answered {status}.")),
+            404 | 410 => Err(words(
+                "Nothing is published at this link.",
+                "По этой ссылке ничего не опубликовано.",
+            )),
+            status => Err(words(
+                format!("The server answered {status}."),
+                format!("Сервер ответил {status}."),
+            )),
         });
     match feed {
         Ok(feed) => Checked {
@@ -1300,25 +1451,25 @@ fn check_feed(url: String) -> Checked {
 /// feed, and leaves the pack in storage for the install job.
 fn download(input: &DownloadInput) -> Result<Inspection, String> {
     let release = &input.release;
-    let _ = jobs::report(0.0, "Downloading");
+    let _ = jobs::report(0.0, &words("Downloading", "Скачивание"));
     let (head, _) = http::download(&release.url, feed::DOWNLOAD).map_err(|e| e.message)?;
     if !head.is_success() {
-        return Err(format!(
-            "the download failed: the server answered {}",
-            head.status
+        return Err(words(
+            format!("the download failed: the server answered {}", head.status),
+            format!("скачать не удалось: сервер ответил {}", head.status),
         ));
     }
     let file = library::read_file(feed::DOWNLOAD, release.size);
     let _ = storage::remove(feed::DOWNLOAD);
-    let _ = jobs::report(0.4, "Unpacking");
+    let _ = jobs::report(0.4, &words("Unpacking", "Распаковка"));
     let bytes = feed::unpack(release, file?)?;
-    let _ = jobs::report(0.6, "Checking the pack");
+    let _ = jobs::report(0.6, &words("Checking the pack", "Проверка пака"));
     let path = format!("downloads/{}.hpk", release.pack_hash);
     let pack = pack::Pack::parse(&bytes).map_err(|e| e.0)?;
     feed::check_pack(release, &pack)?;
     let mut inspection = describe(&path, &pack)?;
     inspection.feed = Some(input.feed.clone());
-    let _ = jobs::report(0.9, "Saving");
+    let _ = jobs::report(0.9, &words("Saving", "Сохранение"));
     storage::write(&path, &bytes).map_err(|e| e.message)?;
     Ok(inspection)
 }
@@ -1326,7 +1477,7 @@ fn download(input: &DownloadInput) -> Result<Inspection, String> {
 /// Verifies a pack completely and describes it.
 fn inspect(path: &str) -> Result<Inspection, String> {
     let bytes = library::read_file(path, pack::MAX_PACK)?;
-    let _ = jobs::report(0.4, "Checking the pack");
+    let _ = jobs::report(0.4, &words("Checking the pack", "Проверка пака"));
     let pack = pack::Pack::parse(&bytes).map_err(|e| format!("{path}: {}", e.0))?;
     describe(path, &pack)
 }

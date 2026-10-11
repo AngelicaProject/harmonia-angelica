@@ -233,7 +233,10 @@ pub fn read_file(path: &str, limit: u64) -> Result<Vec<u8>, String> {
         if size > 0 {
             #[allow(clippy::cast_precision_loss)]
             let fraction = bytes.len() as f32 / size as f32 * 0.3;
-            let _ = angelica_sdk::api::jobs::report(fraction, "Reading the pack");
+            let _ = angelica_sdk::api::jobs::report(
+                fraction,
+                &crate::words("Reading the pack", "Чтение пака"),
+            );
         }
     }
     Ok(bytes)
