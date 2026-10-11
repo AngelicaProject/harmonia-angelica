@@ -62,13 +62,20 @@ jobs:
           cargo build --release --target wasm32-wasip2
           (cd ../angelica && cargo build --release -p angelica-cli)
 
+      # The release of the version tag keeps this version's file, which the
+      # Angelica catalog checks; the release `harmonia` serves the newest
+      # behind the link players install from.
       - name: Sign and publish
         env:
           ANGELICA_AUTHOR_KEY: ${{ secrets.ANGELICA_AUTHOR_KEY }}
         run: |
           key="$RUNNER_TEMP/author.key"
           printf '%s' "$ANGELICA_AUTHOR_KEY" > "$key"
-          ../angelica/target/release/angelica.exe plugin publish . \
-            --component target/wasm32-wasip2/release/harmonia.wasm \
+          tool=../angelica/target/release/angelica.exe
+          mkdir -p dist
+          "$tool" plugin pack . --component target/wasm32-wasip2/release/harmonia.wasm \
+            --key "$key" --output dist/harmonia.angelica
+          "$tool" plugin publish . --component target/wasm32-wasip2/release/harmonia.wasm \
             --github "$GITHUB_REPOSITORY" --key "$key"
           rm -f "$key"
+          gh release create "$GITHUB_REF_NAME" dist/harmonia.angelica --title "Harmonia ${GITHUB_REF_NAME#v}" --generate-notes
