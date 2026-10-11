@@ -17,6 +17,11 @@
 //! a publisher waits for the player's confirmation; later ones signed by
 //! the same key install by themselves.
 //!
+//! Harmonia in Dalamud comes first: when it translated the game in the
+//! previous session on the same game build, this copy stays off for the
+//! session (`library::begin_session`). It is the translation for the days
+//! the game runs without Dalamud.
+//!
 //! Like the Dalamud build, Harmonia changes translations only at game
 //! start: the game copies text into its own caches, so a change in the
 //! middle of a session would show a mix.
@@ -103,12 +108,16 @@ enum Job {
     Compile(String),
 }
 
+// Independent flags of the window and the session, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 struct Harmonia {
     open: bool,
     library: Vec<Translation>,
     settings: Settings,
     /// The translation applied in this session.
     applied: Option<String>,
+    /// Harmonia in Dalamud translates this session, so this copy does not.
+    yielded: bool,
     started_with_game: bool,
     imports: Vec<(String, u64)>,
     inspection: Option<Inspection>,
@@ -611,6 +620,16 @@ impl Harmonia {
                 .and_then(|hash| self.translation(hash))
                 .map(|t| format!("{} · {}", t.title, t.language))
         };
+        if self.yielded {
+            return Some((
+                self.tr(
+                    "Harmonia in Dalamud translates",
+                    "Переводит Harmonia в Dalamud",
+                )
+                .to_owned(),
+                Tone::Muted,
+            ));
+        }
         if self.applied != self.settings.active {
             let text = match name(&self.settings.active) {
                 Some(chosen) => format!("{chosen} — at the next game start"),
@@ -982,6 +1001,7 @@ impl Plugin for Harmonia {
             library: library::load_library()?,
             settings: library::load_settings()?,
             applied: None,
+            yielded: false,
             started_with_game: runtime::started_with_game(),
             imports: library::imports(),
             inspection: None,
@@ -1000,14 +1020,18 @@ impl Plugin for Harmonia {
             russian: runtime::language() == "ru",
         };
         let _ = storage::remove(feed::DOWNLOAD);
-        if plugin.started_with_game
-            && let Some(hash) = plugin.settings.active.clone()
-            && let Err(reason) = plugin.apply(&hash)
-        {
-            plugin.say(
-                format!("No translation in this session: {reason}"),
-                Tone::Warning,
-            );
+        if plugin.started_with_game {
+            // Without the count this copy cannot tell, and translates.
+            plugin.yielded = library::begin_session(&runtime::game_version()).unwrap_or(false);
+            if !plugin.yielded
+                && let Some(hash) = plugin.settings.active.clone()
+                && let Err(reason) = plugin.apply(&hash)
+            {
+                plugin.say(
+                    format!("No translation in this session: {reason}"),
+                    Tone::Warning,
+                );
+            }
         }
         Ok(plugin)
     }
@@ -1070,7 +1094,15 @@ impl Plugin for Harmonia {
                 Tone::Warning,
             );
         }
-        if self.library.is_empty() && self.settings.feeds.is_empty() && self.imports.is_empty() {
+        if self.yielded {
+            window = window.muted(self.tr(
+                "Harmonia in Dalamud translated the game in the previous session, so this copy stays off in this one. It translates from the next start once Harmonia in Dalamud does not run, for example while Dalamud waits for an update after a game update.",
+                "В прошлой игре перевод делала Harmonia в Dalamud, поэтому в этой игре эта копия выключена. Она начнёт переводить со следующего запуска, если Harmonia в Dalamud не запустится, например пока Dalamud ждёт обновления после обновления игры.",
+            ));
+        } else if self.library.is_empty()
+            && self.settings.feeds.is_empty()
+            && self.imports.is_empty()
+        {
             window =
                 window.muted(self.tr("No translation is installed.", "Переводы не установлены."));
         } else if self.applied.is_none() {

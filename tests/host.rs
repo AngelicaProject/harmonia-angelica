@@ -215,6 +215,78 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
     );
 }
 
+/// Whether the Addon row 1 comes out translated.
+fn translates(test: &TestHost) -> bool {
+    let columns = addon().columns;
+    let row = store_row(
+        &test.services().excel,
+        &addon(),
+        1,
+        0,
+        row_buffer(12, &columns, &[b"Hello", b"World"]),
+        12,
+    );
+    row_strings(&row, 12)[1] == "Мир".as_bytes()
+}
+
+#[test]
+fn harmonia_in_dalamud_that_translated_the_previous_session_keeps_this_copy_off() {
+    let mut test = TestHost::new(Limits::default());
+    let storage = test.folder.path().join("storage/harmonia");
+    std::fs::create_dir_all(storage.join("import")).unwrap();
+    std::fs::copy(INTEROP, storage.join("import/interop.hpk")).unwrap();
+    start(&mut test);
+    click(&test, "check-0");
+    wait(&test);
+    click(&test, "install");
+    wait(&test);
+    click(&test, "use-0");
+    wait(&test);
+    let version = test.services().game.version();
+
+    // The plugin was approved in a running game, so session 1 is the next
+    // game start. It translates; Harmonia in Dalamud then answers it.
+    let mut test = TestHost::in_folder(test.folder, Limits::default());
+    start(&mut test);
+    assert!(translates(&test));
+    let answer = |session: u64, game_version: &str| {
+        std::fs::write(
+            storage.join("dalamud.json"),
+            format!(
+                r#"{{"format": 1, "translating": true, "game_version": "{game_version}", "angelica_session": {session}}}"#
+            ),
+        )
+        .unwrap();
+    };
+    answer(1, &version);
+
+    let mut test = TestHost::in_folder(test.folder, Limits::default());
+    start(&mut test);
+    assert!(
+        !translates(&test),
+        "Harmonia in Dalamud translated session 1"
+    );
+    assert!(
+        texts(&test)
+            .iter()
+            .any(|t| t
+                .starts_with("Harmonia in Dalamud translated the game in the previous session")),
+        "{:?}",
+        texts(&test)
+    );
+
+    // No answer in session 2: Dalamud did not load.
+    let mut test = TestHost::in_folder(test.folder, Limits::default());
+    start(&mut test);
+    assert!(translates(&test), "nothing answered session 2");
+
+    // An answer from another game build does not count.
+    answer(3, "2000.01.01.0000.0000");
+    let mut test = TestHost::in_folder(test.folder, Limits::default());
+    start(&mut test);
+    assert!(translates(&test), "the answer is for another game build");
+}
+
 #[test]
 fn a_damaged_pack_is_refused() {
     let mut test = TestHost::new(Limits::default());

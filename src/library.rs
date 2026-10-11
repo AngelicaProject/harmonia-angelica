@@ -8,6 +8,8 @@
 //! tables/<hash>.json      what that table was built from (Stamp)
 //! translations.json       installed translations (Translation)
 //! settings.json           the player's choices (Settings)
+//! session.json            the number of this game start (Session)
+//! dalamud.json            written by Harmonia in Dalamud (Dalamud)
 //! ```
 use angelica_sdk::api::storage;
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,8 @@ use serde::{Deserialize, Serialize};
 pub const IMPORT: &str = "import";
 const LIBRARY: &str = "translations.json";
 const SETTINGS: &str = "settings.json";
+const SESSION: &str = "session.json";
+const DALAMUD: &str = "dalamud.json";
 
 /// An installed translation, from its pack's manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +143,46 @@ pub fn load_stamp(hash: &str) -> Result<Option<Stamp>, String> {
 /// When the stamp cannot be written.
 pub fn save_stamp(stamp: &Stamp) -> Result<(), String> {
     write_json(&stamp_path(&stamp.hash), stamp)
+}
+
+/// The number of the last game start with Harmonia.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Session {
+    session: u64,
+}
+
+/// What Harmonia in Dalamud writes when it translates the game: the game
+/// build and the number of the session it found in `session.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct Dalamud {
+    translating: bool,
+    game_version: String,
+    angelica_session: u64,
+}
+
+/// Counts a game start and tells whether Harmonia in Dalamud translated the
+/// game in the previous session on the same game build. When it did, this
+/// copy stays off: the game is translated once, and Dalamud's build also
+/// keeps what its other plugins read. Once Dalamud stops loading (after a
+/// game update, say), Harmonia in Dalamud no longer answers and this copy
+/// translates from the next start. A damaged `dalamud.json` counts as no
+/// answer.
+///
+/// # Errors
+/// When `session.json` cannot be read or written.
+pub fn begin_session(game_version: &str) -> Result<bool, String> {
+    let previous = read_json::<Session>(SESSION)?.unwrap_or_default().session;
+    write_json(
+        SESSION,
+        &Session {
+            session: previous + 1,
+        },
+    )?;
+    let dalamud = read_json::<Dalamud>(DALAMUD).ok().flatten();
+    Ok(previous > 0
+        && dalamud.is_some_and(|d| {
+            d.translating && d.game_version == game_version && d.angelica_session == previous
+        }))
 }
 
 /// Removes a translation's pack, table, and font files.
