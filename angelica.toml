@@ -15,3 +15,9 @@ memory_bytes = 1073741824
 "excel.text" = true
 "text.case" = true
 "files.replace" = true
+"http.get" = true
+
+# Feeds and packs published on GitHub: a project's pages, its releases, and
+# the hosts GitHub serves release files from.
+[http]
+hosts = ["*.github.io", "github.com", "*.githubusercontent.com"]

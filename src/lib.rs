@@ -11,12 +11,19 @@
 //! letters to the game's letter case when the translation is written in
 //! Cyrillic.
 //!
+//! A translation can also come from its publisher's feed: Harmonia checks
+//! the feed links the player added, downloads a new release in a job,
+//! verifies it like an imported pack, and installs it. The first release of
+//! a publisher waits for the player's confirmation; later ones signed by
+//! the same key install by themselves.
+//!
 //! Like the Dalamud build, Harmonia changes translations only at game
 //! start: the game copies text into its own caches, so a change in the
 //! middle of a session would show a mix.
 pub mod atlas;
 pub mod compile;
 pub mod fdt;
+pub mod feed;
 pub mod font_patch;
 pub mod fonts;
 pub mod library;
@@ -24,8 +31,9 @@ pub mod pack;
 
 use angelica_sdk::{
     Plugin,
-    api::{excel_text, file_replacements, game_files, jobs, runtime, text_case},
-    ui::{Event, Tone, Window},
+    api::{excel_text, file_replacements, game_files, jobs, runtime, storage, text_case},
+    http,
+    ui::{ActionKind, Entry, Event, Mark, Tone, Window},
 };
 use library::{Settings, Stamp, Translation};
 use serde::{Deserialize, Serialize};
@@ -38,13 +46,48 @@ struct Inspection {
     path: String,
     translation: Translation,
     previous_key: Option<String>,
+    /// The feed the pack was downloaded from.
+    #[serde(default)]
+    feed: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct InstallInput {
     path: String,
     hash: String,
+    feed: Option<String>,
 }
+
+/// What a feed offers, or why it could not be read.
+#[derive(Serialize, Deserialize)]
+struct Checked {
+    url: String,
+    title: Option<String>,
+    release: Option<feed::Release>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct DownloadInput {
+    feed: String,
+    release: feed::Release,
+}
+
+enum FeedStatus {
+    UpToDate,
+    Available(Box<feed::Release>),
+    Problem(String),
+}
+
+struct FeedView {
+    title: Option<String>,
+    status: FeedStatus,
+}
+
+/// Seconds after the start before the first check of the feeds, and between
+/// checks.
+const FIRST_CHECK: f64 = 30.0;
+const CHECK_EVERY: f64 = 3600.0;
 
 #[derive(Serialize, Deserialize)]
 struct CompileInput {
@@ -54,6 +97,8 @@ struct CompileInput {
 
 enum Job {
     Inspect,
+    Feeds,
+    Download,
     Install,
     Compile(String),
 }
@@ -74,6 +119,17 @@ struct Harmonia {
     since_status: f64,
     /// Font files served in this session.
     fonts: usize,
+    /// What the last check found, by feed link.
+    feeds: Vec<(String, FeedView)>,
+    feed_input: String,
+    since_check: f64,
+    next_check: f64,
+    /// Releases waiting to be downloaded.
+    pending: Vec<DownloadInput>,
+    /// The id of the chosen row.
+    chosen: Option<String>,
+    /// Whether Angelica's interface is in Russian.
+    russian: bool,
 }
 
 fn short(fingerprint: &str) -> String {
@@ -107,7 +163,6 @@ impl Harmonia {
         self.library.iter().find(|t| t.hash == hash)
     }
 
-    /// Whether the table of `hash` was built with the current settings.
     /// Whether the table of `hash` was built with the current settings and
     /// its fonts from the running game's files.
     fn table_is_current(&self, hash: &str) -> bool {
@@ -230,9 +285,19 @@ impl Harmonia {
                     format!("Installed {} {}.", translation.title, translation.version),
                     Tone::Good,
                 );
-                self.library.push(translation);
-                self.imports = library::imports();
-                self.save();
+                self.installed(translation);
+            }
+            Job::Feeds => {
+                let checked: Vec<Checked> =
+                    serde_json::from_slice(output).map_err(|e| e.to_string())?;
+                for checked in checked {
+                    self.evaluate(checked);
+                }
+            }
+            Job::Download => {
+                let inspection: Inspection =
+                    serde_json::from_slice(output).map_err(|e| e.to_string())?;
+                self.downloaded(inspection);
             }
             Job::Compile(hash) => {
                 let stamp: Stamp = serde_json::from_slice(output).map_err(|e| e.to_string())?;
@@ -263,13 +328,222 @@ impl Harmonia {
         Ok(())
     }
 
+    /// Adds an installed translation. A release from a feed replaces the
+    /// versions the feed installed before, and an imported pack of the same
+    /// publisher and title.
+    fn installed(&mut self, translation: Translation) {
+        let mut chosen = false;
+        if let Some(url) = &translation.feed {
+            let outdated = |old: &Translation| {
+                old.feed.as_deref() == Some(url.as_str())
+                    || (old.feed.is_none()
+                        && old.key.is_some()
+                        && old.key == translation.key
+                        && old.title == translation.title)
+            };
+            let (replaced, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.library)
+                .into_iter()
+                .partition(outdated);
+            self.library = kept;
+            for old in replaced {
+                chosen |= self.settings.active.as_deref() == Some(old.hash.as_str());
+                if self.applied.as_deref() != Some(old.hash.as_str()) {
+                    library::remove_files(&old.hash);
+                }
+            }
+            self.set_feed(url, None, FeedStatus::UpToDate);
+        }
+        let hash = translation.hash.clone();
+        self.library.push(translation);
+        self.imports = library::imports();
+        if chosen {
+            self.settings.active = Some(hash.clone());
+        }
+        self.save();
+        if chosen {
+            self.compile(&hash);
+        }
+    }
+
+    fn set_feed(&mut self, url: &str, title: Option<String>, status: FeedStatus) {
+        if let Some((_, view)) = self.feeds.iter_mut().find(|(feed, _)| feed == url) {
+            view.status = status;
+            if title.is_some() {
+                view.title = title;
+            }
+        } else {
+            self.feeds
+                .push((url.to_owned(), FeedView { title, status }));
+        }
+    }
+
+    /// Decides what a checked feed means for the installed translations. A
+    /// newer release of a translation the feed already installed downloads
+    /// by itself; a feed's first release waits for the player.
+    fn evaluate(&mut self, checked: Checked) {
+        let Checked {
+            url,
+            title,
+            release,
+            error,
+        } = checked;
+        if !self.settings.feeds.contains(&url) {
+            return;
+        }
+        let Some(release) = release else {
+            let reason = error.unwrap_or_else(|| "The feed has no stable release.".into());
+            return self.set_feed(&url, title, FeedStatus::Problem(reason));
+        };
+        // A pack the player imported by hand is the feed's release.
+        if let Some(same) = self
+            .library
+            .iter_mut()
+            .find(|t| t.hash == release.pack_hash && t.feed.is_none())
+        {
+            same.feed = Some(url.clone());
+            self.save();
+        }
+        let installed = self
+            .library
+            .iter()
+            .filter(|t| t.feed.as_deref() == Some(url.as_str()))
+            .map(|t| t.version.as_str())
+            .max();
+        let status = if compile::game_language(&release.game_language).is_none() {
+            FeedStatus::Problem(format!(
+                "The release is made for the game language {}, which the game does not have.",
+                release.game_language
+            ))
+        } else if !release.is_newer_than(installed) {
+            FeedStatus::UpToDate
+        } else if !release.supported_by(env!("CARGO_PKG_VERSION")) {
+            FeedStatus::Problem("The newest release needs a newer Harmonia.".into())
+        } else {
+            if installed.is_some() {
+                self.request(&url, &release);
+            }
+            FeedStatus::Available(Box::new(release))
+        };
+        self.set_feed(&url, title, status);
+    }
+
+    fn request(&mut self, url: &str, release: &feed::Release) {
+        if !self.pending.iter().any(|pending| pending.feed == url) {
+            self.pending.push(DownloadInput {
+                feed: url.to_owned(),
+                release: release.clone(),
+            });
+        }
+    }
+
+    /// A release was downloaded and verified. It installs at once when the
+    /// key that signed it is the key of the translation it replaces;
+    /// anything else is the player's decision.
+    fn downloaded(&mut self, inspection: Inspection) {
+        let translation = &inspection.translation;
+        if self.translation(&translation.hash).is_some() {
+            let _ = storage::remove(&inspection.path);
+            return self.say("This pack is already installed.", Tone::Muted);
+        }
+        let trusted = translation.key.is_some()
+            && self
+                .library
+                .iter()
+                .any(|old| old.feed == inspection.feed && old.key == translation.key);
+        if trusted {
+            let input = InstallInput {
+                path: inspection.path.clone(),
+                hash: translation.hash.clone(),
+                feed: inspection.feed.clone(),
+            };
+            self.start_job("install", &input, Job::Install);
+        } else {
+            self.say(
+                format!(
+                    "{} {} is downloaded and waits for your decision in Harmonia.",
+                    translation.title, translation.version
+                ),
+                Tone::Warning,
+            );
+            self.inspection = Some(inspection);
+        }
+    }
+
+    fn add_feed(&mut self) {
+        let url = self.feed_input.trim().to_owned();
+        if !feed::is_link(&url) {
+            return self.say(
+                "This does not look like a link. It must start with https://",
+                Tone::Warning,
+            );
+        }
+        if self.settings.feeds.contains(&url) {
+            return self.say("This link is already added.", Tone::Muted);
+        }
+        self.settings.feeds.push(url);
+        self.feed_input.clear();
+        self.save();
+        self.next_check = 0.0;
+    }
+
+    /// Drops what waits for the player; a downloaded pack is removed.
+    fn cancel_inspection(&mut self) {
+        if let Some(inspection) = self.inspection.take()
+            && inspection.feed.is_some()
+        {
+            let _ = storage::remove(&inspection.path);
+        }
+    }
+
+    fn click_feed(&mut self, id: &str) -> bool {
+        let index = |prefix: &str| {
+            id.strip_prefix(prefix)
+                .and_then(|i| i.parse::<usize>().ok())
+        };
+        if let Some(index) = index("feed-remove-") {
+            if index < self.settings.feeds.len() {
+                let url = self.settings.feeds.remove(index);
+                self.feeds.retain(|(feed, _)| *feed != url);
+                self.pending.retain(|pending| pending.feed != url);
+                self.save();
+            }
+        } else if let Some(index) = index("feed-get-") {
+            if let Some(url) = self.settings.feeds.get(index).cloned()
+                && let Some((_, view)) = self.feeds.iter().find(|(feed, _)| *feed == url)
+                && let FeedStatus::Available(release) = &view.status
+            {
+                let release = (**release).clone();
+                self.cancel_inspection();
+                self.request(&url, &release);
+            }
+        } else {
+            match id {
+                "feed-add" => self.add_feed(),
+                "feed-check" => self.next_check = 0.0,
+                _ => return false,
+            }
+        }
+        true
+    }
+
     fn click(&mut self, id: &str) {
+        if id.starts_with("row-") {
+            self.chosen = if self.chosen.as_deref() == Some(id) {
+                None
+            } else {
+                Some(id.to_owned())
+            };
+            return;
+        }
+        if self.click_feed(id) {
+            return;
+        }
         if let Some(index) = id
             .strip_prefix("check-")
             .and_then(|i| i.parse::<usize>().ok())
         {
             if let Some((path, _)) = self.imports.get(index).cloned() {
-                self.inspection = None;
+                self.cancel_inspection();
                 self.start_job("inspect", &path, Job::Inspect);
             }
         } else if let Some(index) = id
@@ -312,53 +586,101 @@ impl Harmonia {
                 }
                 "refresh" => self.imports = library::imports(),
                 "install" => {
-                    if let Some(inspection) = &self.inspection {
+                    if self.job.is_some() {
+                        self.say("Wait for the running task to finish.", Tone::Warning);
+                    } else if let Some(inspection) = self.inspection.take() {
                         let input = InstallInput {
-                            path: inspection.path.clone(),
-                            hash: inspection.translation.hash.clone(),
+                            path: inspection.path,
+                            hash: inspection.translation.hash,
+                            feed: inspection.feed,
                         };
-                        self.inspection = None;
                         self.start_job("install", &input, Job::Install);
                     }
                 }
-                "cancel" => self.inspection = None,
+                "cancel" => self.cancel_inspection(),
                 _ => {}
             }
         }
     }
 
-    fn status_lines(&self, window: Window) -> Window {
-        let applied = self
-            .applied
-            .as_deref()
-            .and_then(|hash| self.translation(hash));
-        let chosen = self
-            .settings
-            .active
-            .as_deref()
-            .and_then(|hash| self.translation(hash));
-        let mut window = match applied {
-            Some(translation) => window.toned(
-                format!(
-                    "{} {} ({}) is applied in this session.",
-                    translation.title, translation.version, translation.language
-                ),
-                Tone::Good,
-            ),
-            None => window.text("No translation is applied in this session."),
+    /// The title bar's line: what waits for a game start, else what is
+    /// applied.
+    fn status_line(&self) -> Option<(String, Tone)> {
+        let name = |hash: &Option<String>| {
+            hash.as_deref()
+                .and_then(|hash| self.translation(hash))
+                .map(|t| format!("{} · {}", t.title, t.language))
         };
+        if self.applied != self.settings.active {
+            let text = match name(&self.settings.active) {
+                Some(chosen) => format!("{chosen} — at the next game start"),
+                None => "No translation from the next game start".into(),
+            };
+            return Some((text, Tone::Warning));
+        }
+        name(&self.applied).map(|applied| (applied, Tone::Good))
+    }
+
+    /// `en` or `ru`, by the language of Angelica's interface.
+    fn tr<'a>(&self, en: &'a str, ru: &'a str) -> &'a str {
+        if self.russian { ru } else { en }
+    }
+
+    /// What the last check of `url` found, in words, and whether it is a
+    /// problem.
+    fn feed_state(&self, url: &str) -> (String, bool) {
+        let view = self
+            .feeds
+            .iter()
+            .find(|(feed, _)| feed == url)
+            .map(|(_, view)| &view.status);
+        match view {
+            None => (
+                self.tr("Not checked yet.", "Ещё не проверялось.")
+                    .to_owned(),
+                false,
+            ),
+            Some(FeedStatus::UpToDate) => (
+                self.tr("Up to date.", "Актуальная версия.").to_owned(),
+                false,
+            ),
+            Some(FeedStatus::Available(release)) => (
+                if self.russian {
+                    format!("Доступна версия {}.", release.version)
+                } else {
+                    format!("Version {} is available.", release.version)
+                },
+                false,
+            ),
+            Some(FeedStatus::Problem(reason)) => (reason.clone(), true),
+        }
+    }
+
+    /// What the applied translation did in this session.
+    fn session_facts(&self, mut entry: Entry) -> Entry {
         if let Some(status) = &self.status {
-            window = window.muted(format!(
-                "Translated so far: {} rows, {} cells. Left in the original because the game's text changed: {}.",
-                status.rows_changed, status.cells_replaced, status.guard_mismatches
-            ));
-            if status.rows_refused > 0 {
-                window = window.toned(
+            entry = entry.fact(
+                self.tr("Translated so far", "Переведено в этой игре"),
+                if self.russian {
                     format!(
-                        "Rows with an unexpected layout, left untouched: {}.",
-                        status.rows_refused
-                    ),
-                    Tone::Warning,
+                        "строк: {}, ячеек: {}. Оставлено как в игре, потому что текст игры изменился: {}.",
+                        status.rows_changed, status.cells_replaced, status.guard_mismatches
+                    )
+                } else {
+                    format!(
+                        "{} rows, {} cells. Left in the original because the game's text changed: {}.",
+                        status.rows_changed, status.cells_replaced, status.guard_mismatches
+                    )
+                },
+            );
+            if status.rows_refused > 0 {
+                entry = entry.fact(
+                    self.tr("Left untouched", "Не тронуто"),
+                    if self.russian {
+                        format!("строк с неожиданным устройством: {}.", status.rows_refused)
+                    } else {
+                        format!("{} rows with an unexpected layout.", status.rows_refused)
+                    },
                 );
             }
             if !status.sheets_mismatched.is_empty() {
@@ -368,38 +690,286 @@ impl Harmonia {
                     .take(8)
                     .map(|m| m.sheet.as_str())
                     .collect();
-                window = window.toned(
-                    format!(
-                        "Sheets that differ in this game build, left untouched: {} ({}).",
-                        status.sheets_mismatched.len(),
-                        names.join(", ")
-                    ),
-                    Tone::Warning,
+                entry = entry.fact(
+                    self.tr("Differ in this game build", "Отличаются в этой сборке игры"),
+                    format!("{} ({})", status.sheets_mismatched.len(), names.join(", ")),
                 );
             }
         }
-        if self.applied.is_some() && self.fonts > 0 {
-            window = window.muted(format!(
-                "Fonts: {} game font files with the translation's glyphs.",
-                self.fonts
-            ));
-        }
-        if self.applied != self.settings.active {
-            window = window.toned(
-                match chosen {
-                    Some(translation) => {
-                        format!("{} applies at the next game start.", translation.title)
-                    }
-                    None => "The game stays untranslated from the next start.".into(),
+        if self.fonts > 0 {
+            entry = entry.fact(
+                self.tr("Fonts", "Шрифты"),
+                if self.russian {
+                    format!("файлов шрифтов игры с буквами перевода: {}.", self.fonts)
+                } else {
+                    format!(
+                        "{} game font files with the translation's glyphs.",
+                        self.fonts
+                    )
                 },
-                Tone::Warning,
             );
         }
-        if !self.started_with_game {
-            window = window.toned(
-                "Harmonia was enabled after the game started; translations apply when the game starts.",
-                Tone::Warning,
+        entry
+    }
+
+    /// An installed translation as a row; the chosen one shows what it is
+    /// and what can be done with it.
+    fn translation_entry(&self, index: usize, translation: &Translation) -> Entry {
+        let id = format!("row-t{index}");
+        let hash = translation.hash.as_str();
+        let applied = self.applied.as_deref() == Some(hash);
+        let active = self.settings.active.as_deref() == Some(hash);
+        let idle = self.job.is_none();
+        let mark = match (applied, active) {
+            (true, true) => Mark::On,
+            (false, false) => Mark::Off,
+            _ => Mark::Attention,
+        };
+        let chosen = self.chosen.as_deref() == Some(id.as_str());
+        let mut entry = Entry::new(&id, &translation.title)
+            .note(&translation.language)
+            .value(&translation.version)
+            .mark(mark)
+            .chosen(chosen);
+        if !active && idle {
+            entry = entry.action(format!("use-{index}"), self.tr("Use", "Использовать"));
+        }
+        if !chosen {
+            return entry;
+        }
+        if applied != active {
+            entry = entry.fact(
+                self.tr("State", "Состояние"),
+                if active {
+                    self.tr(
+                        "Applies at the next game start.",
+                        "Применится при следующем запуске игры.",
+                    )
+                } else {
+                    self.tr(
+                        "In use until the game closes.",
+                        "Используется, пока игра не закрыта.",
+                    )
+                },
             );
+        }
+        let feed = translation.feed.as_deref();
+        entry = entry
+            .fact(self.tr("Team", "Команда"), &translation.team)
+            .fact(
+                self.tr("Translation", "Перевод"),
+                format!(
+                    "{} ← {}, {} {}",
+                    translation.language,
+                    translation.game_language,
+                    translation.cells,
+                    self.tr("cells", "ячеек")
+                ),
+            )
+            .fact(
+                self.tr("Made for game", "Для игры"),
+                &translation.game_version,
+            )
+            .fact(
+                self.tr("Publisher", "Издатель"),
+                translation.key.as_deref().map_or_else(
+                    || self.tr("not signed", "без подписи").to_owned(),
+                    |key| format!("{} {}", self.tr("key", "ключ"), short(key)),
+                ),
+            )
+            .fact(
+                self.tr("Updates", "Обновления"),
+                feed.map_or_else(
+                    || {
+                        self.tr(
+                            "No link; updated from a file.",
+                            "Нет ссылки; обновляется из файла.",
+                        )
+                        .to_owned()
+                    },
+                    |url| self.feed_state(url).0,
+                ),
+            );
+        if applied {
+            entry = self.session_facts(entry);
+        }
+        self.translation_actions(entry, index, translation)
+    }
+
+    /// What can be done with the chosen translation.
+    fn translation_actions(
+        &self,
+        mut entry: Entry,
+        index: usize,
+        translation: &Translation,
+    ) -> Entry {
+        let idle = self.job.is_none();
+        let active = self.settings.active.as_deref() == Some(translation.hash.as_str());
+        let feed = translation.feed.as_deref();
+        if active {
+            entry = entry.more(
+                "none",
+                self.tr("Stop using", "Не использовать"),
+                ActionKind::Normal,
+                idle,
+            );
+        }
+        if let Some(position) =
+            feed.and_then(|url| self.settings.feeds.iter().position(|f| f == url))
+        {
+            entry = entry.more(
+                format!("feed-remove-{position}"),
+                self.tr("Forget the link", "Забыть ссылку"),
+                ActionKind::Quiet,
+                idle,
+            );
+        }
+        entry.more(
+            format!("remove-{index}"),
+            self.tr("Remove", "Удалить"),
+            ActionKind::Danger,
+            idle,
+        )
+    }
+
+    /// A feed nothing is installed from yet.
+    fn feed_entry(&self, index: usize, url: &str) -> Entry {
+        let id = format!("row-f{index}");
+        let view = self.feeds.iter().find(|(feed, _)| feed == url);
+        let title = view
+            .and_then(|(_, view)| view.title.as_deref())
+            .unwrap_or(url);
+        let (state, problem) = self.feed_state(url);
+        let chosen = self.chosen.as_deref() == Some(id.as_str());
+        let mut entry = Entry::new(&id, title)
+            .note(state)
+            .mark(if problem { Mark::Attention } else { Mark::None })
+            .chosen(chosen);
+        let waits = self.pending.iter().any(|pending| pending.feed == url);
+        if matches!(view, Some((_, view)) if matches!(view.status, FeedStatus::Available(_)))
+            && !waits
+            && self.job.is_none()
+        {
+            entry = entry.action(format!("feed-get-{index}"), self.tr("Download", "Скачать"));
+        }
+        if chosen {
+            entry = entry.fact(self.tr("Link", "Ссылка"), url).more(
+                format!("feed-remove-{index}"),
+                self.tr("Forget the link", "Забыть ссылку"),
+                ActionKind::Quiet,
+                self.job.is_none(),
+            );
+        }
+        entry
+    }
+
+    /// The pack that waits for the player's decision.
+    fn inspection_lines(&self, window: Window, inspection: &Inspection) -> Window {
+        let translation = &inspection.translation;
+        let mut window = window
+            .heading(format!("{} {}", translation.title, translation.version))
+            .text(if self.russian {
+                format!(
+                    "{} — перевод на {} с {}, ячеек: {}, листов: {}, сделан для игры {}.",
+                    translation.team,
+                    translation.language,
+                    translation.game_language,
+                    translation.cells,
+                    translation.sheets,
+                    translation.game_version
+                )
+            } else {
+                format!(
+                    "{} — {} translation from {}, {} cells in {} sheets, made for game {}.",
+                    translation.team,
+                    translation.language,
+                    translation.game_language,
+                    translation.cells,
+                    translation.sheets,
+                    translation.game_version
+                )
+            });
+        window = match &translation.key {
+            Some(key) if self.russian => window.text(format!(
+                "Подписан ключом {}. Устанавливайте, только если доверяете этому издателю.",
+                short(key)
+            )),
+            Some(key) => window.text(format!(
+                "Signed by key {}. Install only if you trust this publisher.",
+                short(key)
+            )),
+            None => window.toned(
+                self.tr(
+                    "This pack is not signed: anyone could have made or changed it.",
+                    "Этот пак не подписан: его мог сделать или изменить кто угодно.",
+                ),
+                Tone::Warning,
+            ),
+        };
+        window
+            .row(|row| {
+                row.action(
+                    "install",
+                    self.tr("Install", "Установить"),
+                    ActionKind::Main,
+                    self.job.is_none(),
+                )
+                .action(
+                    "cancel",
+                    self.tr("Not now", "Не сейчас"),
+                    ActionKind::Quiet,
+                    true,
+                )
+            })
+            .separator()
+    }
+
+    /// The installed translations, in use first, then the feeds nothing is
+    /// installed from and the files waiting in the import folder.
+    fn rows(&self, mut window: Window) -> Window {
+        let in_use = |t: &Translation| {
+            self.applied.as_deref() == Some(t.hash.as_str())
+                || self.settings.active.as_deref() == Some(t.hash.as_str())
+        };
+        for (used, title) in [
+            (true, self.tr("In use", "Используется")),
+            (false, self.tr("Installed", "Установлены")),
+        ] {
+            let mut first = true;
+            for (index, translation) in self.library.iter().enumerate() {
+                if in_use(translation) != used {
+                    continue;
+                }
+                if std::mem::take(&mut first) {
+                    window = window.heading(title);
+                }
+                window = window.entry(self.translation_entry(index, translation));
+            }
+        }
+        let mut first = true;
+        for (index, url) in self.settings.feeds.iter().enumerate() {
+            if self
+                .library
+                .iter()
+                .any(|t| t.feed.as_deref() == Some(url.as_str()))
+            {
+                continue;
+            }
+            if std::mem::take(&mut first) {
+                window = window.heading(self.tr("By link", "По ссылке"));
+            }
+            window = window.entry(self.feed_entry(index, url));
+        }
+        if !self.imports.is_empty() {
+            window = window.heading(self.tr("Files", "Файлы"));
+        }
+        for (index, (path, size)) in self.imports.iter().enumerate() {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let mut entry = Entry::new(format!("row-i{index}"), name).note(megabytes(*size));
+            if self.job.is_none() {
+                entry = entry.action(format!("check-{index}"), self.tr("Check", "Проверить"));
+            }
+            window = window.entry(entry);
         }
         window
     }
@@ -421,7 +991,15 @@ impl Plugin for Harmonia {
             status: None,
             since_status: f64::INFINITY,
             fonts: 0,
+            feeds: Vec::new(),
+            feed_input: String::new(),
+            since_check: 0.0,
+            next_check: FIRST_CHECK,
+            pending: Vec::new(),
+            chosen: None,
+            russian: runtime::language() == "ru",
         };
+        let _ = storage::remove(feed::DOWNLOAD);
         if plugin.started_with_game
             && let Some(hash) = plugin.settings.active.clone()
             && let Err(reason) = plugin.apply(&hash)
@@ -452,6 +1030,17 @@ impl Plugin for Harmonia {
                 }
             }
         }
+        self.since_check += elapsed;
+        if self.job.is_none() {
+            if let Some(input) = self.pending.pop() {
+                self.start_job("download", &input, Job::Download);
+            } else if !self.settings.feeds.is_empty() && self.since_check >= self.next_check {
+                self.since_check = 0.0;
+                self.next_check = CHECK_EVERY;
+                let feeds = self.settings.feeds.clone();
+                self.start_job("feeds", &feeds, Job::Feeds);
+            }
+        }
         self.since_status += elapsed;
         if self.applied.is_some() && self.since_status >= 1.0 {
             self.since_status = 0.0;
@@ -464,90 +1053,71 @@ impl Plugin for Harmonia {
         if !self.open {
             return Vec::new();
         }
-        let mut window = Window::new(WINDOW, "Harmonia").heading("This session");
-        window = self
-            .status_lines(window)
-            .separator()
-            .heading("Translations");
-        if self.library.is_empty() {
-            window = window.muted("No translation is installed.");
+        self.russian = runtime::language() == "ru";
+        let mut window = Window::new(WINDOW, "Harmonia");
+        if let Some((text, tone)) = self.status_line() {
+            window = window.status(text, tone);
         }
-        for (index, translation) in self.library.iter().enumerate() {
-            let chosen = self.settings.active.as_deref() == Some(translation.hash.as_str());
-            let key = translation.key.as_deref().map_or_else(
-                || "unsigned".to_owned(),
-                |key| format!("key {}", short(key)),
-            );
-            window = window
-                .text(format!(
-                    "{} {} — {}",
-                    translation.title, translation.version, translation.team
-                ))
-                .muted(format!(
-                    "{} from {}, {} cells; game {}; {key}",
-                    translation.language,
-                    translation.game_language,
-                    translation.cells,
-                    translation.game_version
-                ))
-                .row(|row| {
-                    row.button_enabled(
-                        format!("use-{index}"),
-                        if chosen { "Chosen" } else { "Use" },
-                        !chosen && self.job.is_none(),
-                    )
-                    .button_enabled(
-                        format!("remove-{index}"),
-                        "Remove",
-                        self.job.is_none(),
-                    )
-                });
-        }
-        if self.settings.active.is_some() {
-            window = window.button_enabled("none", "Use no translation", self.job.is_none());
-        }
-        window = window.separator().heading("Add a translation").muted(
-            "Put a .hpk file into the import folder of Harmonia's plugin folder (Angelica menu, Open plugin folder), then check it here.",
-        );
-        for (index, (path, size)) in self.imports.iter().enumerate() {
-            window = window.row(|row| {
-                row.text(format!("{path} ({})", megabytes(*size)))
-                    .button_enabled(format!("check-{index}"), "Check", self.job.is_none())
-            });
-        }
-        window = window.button("refresh", "Look again");
         if let Some(inspection) = &self.inspection {
-            let translation = &inspection.translation;
-            window = window
-                .separator()
-                .heading(format!("{} {}", translation.title, translation.version))
-                .text(format!(
-                    "{} — {} translation from {}, {} cells in {} sheets, made for game {}.",
-                    translation.team,
-                    translation.language,
-                    translation.game_language,
-                    translation.cells,
-                    translation.sheets,
-                    translation.game_version
-                ));
-            window = match &translation.key {
-                Some(key) => window.text(format!(
-                    "Signed by key {}. Install only if you trust this publisher.",
-                    short(key)
-                )),
-                None => window.toned(
-                    "This pack is not signed: anyone could have made or changed it.",
-                    Tone::Warning,
-                ),
-            };
-            window = window.row(|row| row.button("install", "Install").button("cancel", "Cancel"));
+            window = self.inspection_lines(window, inspection);
         }
+        if !self.started_with_game {
+            window = window.toned(
+                self.tr(
+                    "Harmonia was enabled after the game started; translations apply when the game starts.",
+                    "Harmonia включена после запуска игры; переводы применяются при запуске игры.",
+                ),
+                Tone::Warning,
+            );
+        }
+        if self.library.is_empty() && self.settings.feeds.is_empty() && self.imports.is_empty() {
+            window =
+                window.muted(self.tr("No translation is installed.", "Переводы не установлены."));
+        } else if self.applied.is_none() {
+            window = window.muted(self.tr(
+                "No translation is applied in this session.",
+                "В этой игре перевод не применён.",
+            ));
+        }
+        window = self.rows(window);
         if self.job.is_some() {
             window = window.progress(self.progress.0, &self.progress.1);
         }
         if !self.message.0.is_empty() {
             window = window.toned(&self.message.0, self.message.1);
         }
+        window = window
+            .separator()
+            .input(
+                "feed",
+                "",
+                &self.feed_input,
+                self.tr("Link to a translation", "Ссылка на перевод"),
+            )
+            .row(|row| {
+                row.action(
+                    "feed-add",
+                    self.tr("Add", "Добавить"),
+                    ActionKind::Normal,
+                    true,
+                )
+                .action(
+                    "feed-check",
+                    self.tr("Check for updates", "Проверить обновления"),
+                    ActionKind::Quiet,
+                    !self.settings.feeds.is_empty() && self.job.is_none(),
+                )
+                .action(
+                    "refresh",
+                    self.tr("Look for files", "Найти файлы"),
+                    ActionKind::Quiet,
+                    true,
+                )
+                .tooltip(self.tr(
+                    "A .hpk file goes into the import folder of Harmonia's folder: the window's menu, Open folder.",
+                    "Файл .hpk кладётся в папку import в папке Harmonia: меню окна, «Открыть папку».",
+                ))
+            });
         vec![window]
     }
 
@@ -559,6 +1129,7 @@ impl Plugin for Harmonia {
             }
             Event::Closed(_) => self.open = false,
             Event::Clicked(target) => self.click(&target.id),
+            Event::Edited(edited) if edited.id == "feed" => self.feed_input = edited.value,
             _ => {}
         }
     }
@@ -576,12 +1147,22 @@ impl Plugin for Harmonia {
                 if inspection.translation.hash != input.hash {
                     return Err("the file changed after it was checked; check it again".into());
                 }
-                angelica_sdk::api::storage::rename(
-                    &input.path,
-                    &inspection.translation.pack_path(),
-                )
-                .map_err(|e| e.message)?;
-                serde_json::to_vec(&inspection.translation)
+                storage::rename(&input.path, &inspection.translation.pack_path())
+                    .map_err(|e| e.message)?;
+                let mut translation = inspection.translation;
+                translation.feed = input.feed;
+                serde_json::to_vec(&translation)
+            }
+            "feeds" => {
+                let feeds: Vec<String> =
+                    serde_json::from_slice(&input).map_err(|e| e.to_string())?;
+                let checked: Vec<Checked> = feeds.into_iter().map(check_feed).collect();
+                serde_json::to_vec(&checked)
+            }
+            "download" => {
+                let input: DownloadInput =
+                    serde_json::from_slice(&input).map_err(|e| e.to_string())?;
+                serde_json::to_vec(&download(&input)?)
             }
             "compile" => {
                 let input: CompileInput =
@@ -597,8 +1178,7 @@ impl Plugin for Harmonia {
                 let _ = jobs::report(0.8, "Preparing fonts");
                 let (fonts, font_reports) = prepare_fonts(&pack, &input.hash)?;
                 let _ = jobs::report(0.9, "Saving");
-                angelica_sdk::api::storage::write(&library::table_path(&input.hash), &table)
-                    .map_err(|e| e.message)?;
+                storage::write(&library::table_path(&input.hash), &table).map_err(|e| e.message)?;
                 let stamp = Stamp {
                     hash: input.hash,
                     kept_sheets: input.kept_sheets,
@@ -647,10 +1227,68 @@ fn prepare_fonts(pack: &pack::Pack<'_>, hash: &str) -> Result<PreparedFonts, Str
     let mut files = Vec::new();
     for (game_path, contents) in &patched.files {
         let storage_path = library::font_path(hash, game_path);
-        angelica_sdk::api::storage::write(&storage_path, contents).map_err(|e| e.message)?;
+        storage::write(&storage_path, contents).map_err(|e| e.message)?;
         files.push((game_path.clone(), storage_path));
     }
     Ok((files, patched.reports))
+}
+
+/// Reads a feed and picks its newest release.
+fn check_feed(url: String) -> Checked {
+    let feed = http::get(&url)
+        .map_err(|error| format!("The feed could not be read: {}", error.message))
+        .and_then(|response| match response.head.status {
+            200..=299 => feed::parse(&response.body).map_err(|reason| {
+                let mut reason = reason;
+                if let Some(first) = reason.get_mut(..1) {
+                    first.make_ascii_uppercase();
+                }
+                format!("{reason}.")
+            }),
+            404 | 410 => Err("Nothing is published at this link.".into()),
+            status => Err(format!("The server answered {status}.")),
+        });
+    match feed {
+        Ok(feed) => Checked {
+            url,
+            release: feed.newest().cloned(),
+            title: feed.title,
+            error: None,
+        },
+        Err(error) => Checked {
+            url,
+            title: None,
+            release: None,
+            error: Some(error),
+        },
+    }
+}
+
+/// Downloads a release, verifies the file and the pack in it against the
+/// feed, and leaves the pack in storage for the install job.
+fn download(input: &DownloadInput) -> Result<Inspection, String> {
+    let release = &input.release;
+    let _ = jobs::report(0.0, "Downloading");
+    let (head, _) = http::download(&release.url, feed::DOWNLOAD).map_err(|e| e.message)?;
+    if !head.is_success() {
+        return Err(format!(
+            "the download failed: the server answered {}",
+            head.status
+        ));
+    }
+    let file = library::read_file(feed::DOWNLOAD, release.size);
+    let _ = storage::remove(feed::DOWNLOAD);
+    let _ = jobs::report(0.4, "Unpacking");
+    let bytes = feed::unpack(release, file?)?;
+    let _ = jobs::report(0.6, "Checking the pack");
+    let path = format!("downloads/{}.hpk", release.pack_hash);
+    let pack = pack::Pack::parse(&bytes).map_err(|e| e.0)?;
+    feed::check_pack(release, &pack)?;
+    let mut inspection = describe(&path, &pack)?;
+    inspection.feed = Some(input.feed.clone());
+    let _ = jobs::report(0.9, "Saving");
+    storage::write(&path, &bytes).map_err(|e| e.message)?;
+    Ok(inspection)
 }
 
 /// Verifies a pack completely and describes it.
@@ -658,6 +1296,10 @@ fn inspect(path: &str) -> Result<Inspection, String> {
     let bytes = library::read_file(path, pack::MAX_PACK)?;
     let _ = jobs::report(0.4, "Checking the pack");
     let pack = pack::Pack::parse(&bytes).map_err(|e| format!("{path}: {}", e.0))?;
+    describe(path, &pack)
+}
+
+fn describe(path: &str, pack: &pack::Pack<'_>) -> Result<Inspection, String> {
     if compile::game_language(&pack.manifest.game.language).is_none() {
         return Err(format!(
             "{path}: the game has no language {}",
@@ -667,6 +1309,7 @@ fn inspect(path: &str) -> Result<Inspection, String> {
     let manifest = &pack.manifest;
     Ok(Inspection {
         path: path.to_owned(),
+        feed: None,
         previous_key: pack
             .signature
             .as_ref()
@@ -684,6 +1327,7 @@ fn inspect(path: &str) -> Result<Inspection, String> {
             key: pack.signature.as_ref().map(pack::Signature::fingerprint),
             sheets: pack.sheet_count(),
             cells: pack.cell_count(),
+            feed: None,
         },
     })
 }

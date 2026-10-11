@@ -7,7 +7,7 @@ use runtime::{
     host::{Action, Event, Status},
     sandbox::{
         Limits,
-        bindings::angelica::plugin::ui::{Widget, WidgetRef},
+        bindings::angelica::plugin::ui::{Edited, Widget, WidgetRef},
     },
 };
 use std::{path::Path, sync::OnceLock, time::Duration};
@@ -45,14 +45,24 @@ fn click(test: &TestHost, id: &str) {
 }
 
 fn texts(test: &TestHost) -> Vec<String> {
-    test.host.plugin("harmonia").unwrap().windows()[0]
-        .widgets
-        .iter()
-        .filter_map(|widget| match widget {
-            Widget::Text(shown) => Some(shown.text.clone()),
-            _ => None,
-        })
-        .collect()
+    let mut shown = Vec::new();
+    for widget in &test.host.plugin("harmonia").unwrap().windows()[0].widgets {
+        match widget {
+            Widget::Text(line) => shown.push(line.text.clone()),
+            Widget::Entry(entry) => {
+                shown.extend([entry.title.clone(), entry.note.clone()]);
+                shown.push(format!("{:?}", entry.mark));
+                shown.extend(
+                    entry
+                        .facts
+                        .iter()
+                        .map(|fact| format!("{}: {}", fact.name, fact.value)),
+                );
+            }
+            _ => {}
+        }
+    }
+    shown
 }
 
 fn has_progress(test: &TestHost) -> bool {
@@ -149,12 +159,7 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
     let mut test = TestHost::in_folder(folder, Limits::default());
     start(&mut test);
     let shown = texts(&test);
-    assert!(
-        shown
-            .iter()
-            .any(|t| t.starts_with("Interop test pack 2026.10.01.0001 (ru) is applied")),
-        "{shown:?}"
-    );
+    assert!(shown.iter().any(|t| t == "Mark::On"), "{shown:?}");
 
     let excel = &test.services().excel;
     let columns = addon().columns;
@@ -199,6 +204,7 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
     assert_eq!(name, "Паладин".as_bytes(), "ru is written in Cyrillic");
 
     // Harmonia refreshes the counters once a second of frames.
+    click(&test, "row-t0");
     test.frames(61);
     assert!(
         texts(&test)
@@ -261,9 +267,7 @@ fn a_real_pack_compiles_within_the_job_limits() {
     start(&mut test);
     eprintln!("applied in {:?}: {:?}", started.elapsed(), texts(&test));
     assert!(
-        texts(&test)
-            .iter()
-            .any(|t| t.contains("is applied in this session")),
+        texts(&test).iter().any(|t| t == "Mark::On"),
         "{:?}",
         texts(&test)
     );
@@ -334,6 +338,8 @@ fn a_pack_with_fonts_replaces_the_games_font_files_at_the_next_start() {
     let folder = test.folder;
     let mut test = TestHost::in_folder(folder, Limits::default());
     start(&mut test);
+    click(&test, "row-t0");
+    test.frames(1);
     let shown = texts(&test);
     assert!(shown.iter().any(|t| t.starts_with("Fonts: ")), "{shown:?}");
     let target = harmonia::pack::Pack::parse(&pack)
@@ -351,5 +357,64 @@ fn a_pack_with_fonts_replaces_the_games_font_files_at_the_next_start() {
                     .as_bytes()
             )
             .is_some()
+    );
+}
+
+/// The whole path from a feed link to an installed translation, against a
+/// feed published on the network.
+#[test]
+#[ignore = "needs the network and a feed link in HARMONIA_FEED"]
+fn a_feed_release_is_downloaded_checked_and_installed() {
+    let feed = std::env::var("HARMONIA_FEED").unwrap();
+    let mut test = TestHost::new(Limits {
+        memory_bytes: 1 << 30,
+        ..Limits::default()
+    });
+    start(&mut test);
+    test.event(
+        "harmonia",
+        Event::Edited(Edited {
+            window: "main".into(),
+            id: "feed".into(),
+            value: feed,
+        }),
+    );
+    click(&test, "feed-add");
+    wait(&test);
+    let shown = texts(&test);
+    assert!(
+        shown.iter().any(|t| t.ends_with("is available.")),
+        "{shown:?}"
+    );
+
+    click(&test, "feed-get-0");
+    wait(&test);
+    let shown = texts(&test);
+    assert!(
+        shown.iter().any(|t| t.starts_with("Signed by key ")),
+        "{shown:?}"
+    );
+
+    click(&test, "install");
+    wait(&test);
+    let shown = texts(&test);
+    assert!(
+        shown.iter().any(|t| t.starts_with("Installed ")),
+        "{shown:?}"
+    );
+    click(&test, "row-t0");
+    test.frames(1);
+    let shown = texts(&test);
+    assert!(
+        shown.contains(&"Updates: Up to date.".to_owned()),
+        "{shown:?}"
+    );
+    let storage = test.folder.path().join("storage/harmonia");
+    assert_eq!(std::fs::read_dir(storage.join("packs")).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read_dir(storage.join("downloads"))
+            .unwrap()
+            .count(),
+        0
     );
 }

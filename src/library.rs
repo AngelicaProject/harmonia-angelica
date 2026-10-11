@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! import/                 the player puts .hpk files here
+//! downloads/              a release from a feed, until it is installed
 //! packs/<hash>.hpk        installed packs, named by their pack hash
 //! tables/<hash>.table     the text table of a pack, for the host
 //! tables/<hash>.json      what that table was built from (Stamp)
@@ -31,6 +32,9 @@ pub struct Translation {
     pub key: Option<String>,
     pub sheets: usize,
     pub cells: usize,
+    /// The feed the translation updates from.
+    #[serde(default)]
+    pub feed: Option<String>,
 }
 
 impl Translation {
@@ -68,6 +72,9 @@ pub struct Settings {
     pub active: Option<String>,
     /// Sheets (`Item`) and folders (`quest/*`) kept in the game's language.
     pub kept_sheets: Vec<String>,
+    /// The feed links Harmonia checks for new versions.
+    #[serde(default)]
+    pub feeds: Vec<String>,
 }
 
 /// What a table was built from: a table is current while these match.
