@@ -1150,7 +1150,18 @@ impl Plugin for Harmonia {
         let _ = storage::remove(feed::DOWNLOAD);
         if plugin.started_with_game {
             // Without the count this copy cannot tell, and translates.
-            plugin.yielded = library::begin_session(&runtime::game_version()).unwrap_or(false);
+            plugin.yielded = match library::begin_session(&runtime::game_version()) {
+                Ok(yielded) => yielded,
+                Err(error) => {
+                    angelica_sdk::warning(&format!("The session is not counted: {error}"));
+                    false
+                }
+            };
+            if plugin.yielded {
+                angelica_sdk::info(
+                    "Harmonia in Dalamud translated the previous session on this game build; this copy stays off.",
+                );
+            }
             if !plugin.yielded
                 && let Some(hash) = plugin.settings.active.clone()
                 && let Err(reason) = plugin.apply(&hash)
