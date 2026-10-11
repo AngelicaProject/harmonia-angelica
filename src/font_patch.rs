@@ -313,9 +313,8 @@ mod tests {
     use super::*;
     use crate::{atlas::TEXTURE_HEADER, pack::Pack};
 
-    const FONTS: &[u8] = include_bytes!("../../Harmonia.Tests/TestData/harmonia-interop-fonts.hpk");
-    const REPLACEMENTS: &[u8] =
-        include_bytes!("../../Harmonia.Tests/TestData/harmonia-interop-replacements.hpk");
+    const FONTS: &[u8] = include_bytes!("../tests/data/harmonia-interop-fonts.hpk");
+    const REPLACEMENTS: &[u8] = include_bytes!("../tests/data/harmonia-interop-replacements.hpk");
 
     /// A font table with ASCII 'A' on page 0 and the given metrics.
     fn table(line_height: i32, ascent: i32, extra: &[u32]) -> Vec<u8> {

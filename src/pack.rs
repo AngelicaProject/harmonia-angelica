@@ -702,10 +702,9 @@ fn verify_signature(signature: &Signature, hash: &[u8; 32]) -> Result<(), Error>
 mod tests {
     use super::*;
 
-    const INTEROP: &[u8] = include_bytes!("../../Harmonia.Tests/TestData/harmonia-interop.hpk");
-    const FONTS: &[u8] = include_bytes!("../../Harmonia.Tests/TestData/harmonia-interop-fonts.hpk");
-    const REPLACEMENTS: &[u8] =
-        include_bytes!("../../Harmonia.Tests/TestData/harmonia-interop-replacements.hpk");
+    const INTEROP: &[u8] = include_bytes!("../tests/data/harmonia-interop.hpk");
+    const FONTS: &[u8] = include_bytes!("../tests/data/harmonia-interop-fonts.hpk");
+    const REPLACEMENTS: &[u8] = include_bytes!("../tests/data/harmonia-interop-replacements.hpk");
 
     #[test]
     fn reads_the_font_sections() {

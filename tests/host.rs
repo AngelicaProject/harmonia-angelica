@@ -13,7 +13,7 @@ use runtime::{
 use std::{path::Path, sync::OnceLock, time::Duration};
 
 const MANIFEST: &str = include_str!("../angelica.toml");
-const INTEROP: &str = "../Harmonia.Tests/TestData/harmonia-interop.hpk";
+const INTEROP: &str = "tests/data/harmonia-interop.hpk";
 
 fn component() -> &'static [u8] {
     static COMPONENT: OnceLock<Vec<u8>> = OnceLock::new();
@@ -387,7 +387,7 @@ fn font_game(pack: &[u8]) -> angelica_fake_game::game_files::FakeGame {
 
 #[test]
 fn a_pack_with_fonts_replaces_the_games_font_files_at_the_next_start() {
-    const FONTS: &str = "../Harmonia.Tests/TestData/harmonia-interop-fonts.hpk";
+    const FONTS: &str = "tests/data/harmonia-interop-fonts.hpk";
     let pack = std::fs::read(FONTS).unwrap();
     let mut test = TestHost::new(Limits::default());
     font_game(&pack).write(&test.game_folder()).unwrap();

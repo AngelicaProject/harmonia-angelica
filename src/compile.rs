@@ -132,7 +132,7 @@ mod tests {
     use super::*;
     use angelica_sdk::text::table::Table;
 
-    const INTEROP: &[u8] = include_bytes!("../../Harmonia.Tests/TestData/harmonia-interop.hpk");
+    const INTEROP: &[u8] = include_bytes!("../tests/data/harmonia-interop.hpk");
 
     #[test]
     fn every_pack_cell_becomes_a_table_cell() {
