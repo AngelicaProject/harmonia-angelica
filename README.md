@@ -23,6 +23,8 @@ cargo build --release --target wasm32-wasip2
 
 `tests/host.rs` runs the plugin in the Angelica host against a scripted game. `HARMONIA_PACK=<pack> cargo test --release --test host -- --ignored` also runs it with a real pack, and `HARMONIA_FEED=<feed link> cargo test --release --test host a_feed_release -- --ignored` with a published feed over the network.
 
+CI checks every push and pull request (`.github/workflows/ci.yml`). A release is a tag `v<version>` on `main` matching `plugin.version` in `angelica.toml`: `.github/workflows/release.yml` builds the component, signs it with the author key (the repository secret `ANGELICA_AUTHOR_KEY`), and publishes it behind the link that stays the same across versions, `https://github.com/AngelicaProject/harmonia-angelica/releases/download/harmonia/harmonia.angelica`. Installed copies update from it.
+
 Translation packs are made with [Aeria](https://github.com/AngelicaProject/Aeria), which specifies the pack and feed formats. How the plugin works and the rules for changing it are in [AGENTS.md](AGENTS.md).
 
 ## License

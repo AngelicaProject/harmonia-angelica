@@ -89,6 +89,7 @@ dependencies = [
  "angelica-pe",
  "angelica-sqpack",
  "angelica-text",
+ "angelica-update",
  "ed25519-dalek",
  "egui",
  "getrandom",
@@ -149,6 +150,18 @@ dependencies = [
 name = "angelica-text"
 version = "0.1.0"
 dependencies = [
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
+name = "angelica-update"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "semver",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror",
 ]

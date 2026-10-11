@@ -1,0 +1,74 @@
+name: Release
+
+# A release is a tag v<version> on main whose version is plugin.version in
+# angelica.toml. CI builds the component, signs the plugin file with the
+# author key (the secret ANGELICA_AUTHOR_KEY), and publishes it behind the
+# link that stays the same across versions:
+# https://github.com/AngelicaProject/harmonia-angelica/releases/download/harmonia/harmonia.angelica
+# Installed copies update from that link.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: harmonia-angelica
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          path: harmonia-angelica
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          repository: AngelicaProject/angelica
+          ref: main
+          path: angelica
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: 1.98.1
+          targets: wasm32-wasip2
+
+      - name: Check the tag
+        run: |
+          declared=$(sed -n '/^\[plugin\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' angelica.toml)
+          if [ "v$declared" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME does not match plugin.version $declared"
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME does not point at a commit on main"
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test
+
+      - name: Build the component and the angelica tool
+        run: |
+          cargo build --release --target wasm32-wasip2
+          (cd ../angelica && cargo build --release -p angelica-cli)
+
+      - name: Sign and publish
+        env:
+          ANGELICA_AUTHOR_KEY: ${{ secrets.ANGELICA_AUTHOR_KEY }}
+        run: |
+          key="$RUNNER_TEMP/author.key"
+          printf '%s' "$ANGELICA_AUTHOR_KEY" > "$key"
+          ../angelica/target/release/angelica.exe plugin publish . \
+            --component target/wasm32-wasip2/release/harmonia.wasm \
+            --github "$GITHUB_REPOSITORY" --key "$key"
+          rm -f "$key"
