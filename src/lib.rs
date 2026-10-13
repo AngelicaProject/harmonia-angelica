@@ -137,6 +137,11 @@ struct Harmonia {
     pending: Vec<DownloadInput>,
     /// The id of the chosen row.
     chosen: Option<String>,
+    /// The feed whose release downloads now.
+    downloading: Option<String>,
+    /// Whether the field for a link is shown.
+    adding: bool,
+    since_imports: f64,
     /// Whether Angelica's interface is in Russian.
     russian: bool,
 }
@@ -200,11 +205,10 @@ impl Harmonia {
             )
         })?;
         if !self.table_is_current(hash) {
+            // The window asks for a restart and shows the preparation on the
+            // translation's row; no message repeats it.
             self.compile(hash);
-            return Err(words(
-                "the translation is being prepared; it applies at the next game start",
-                "перевод готовится; он применится при следующем запуске игры",
-            ));
+            return Ok(());
         }
         let info =
             excel_text::activate(TABLE, &library::table_path(hash), 0).map_err(|e| e.message)?;
@@ -628,7 +632,17 @@ impl Harmonia {
             }
         } else {
             match id {
-                "feed-add" => self.add_feed(),
+                "feed-add" => {
+                    self.add_feed();
+                    if self.feed_input.is_empty() {
+                        self.adding = false;
+                    }
+                }
+                "feed-open" => self.adding = true,
+                "feed-close" => {
+                    self.adding = false;
+                    self.feed_input.clear();
+                }
                 "feed-check" => self.next_check = 0.0,
                 _ => return false,
             }
@@ -698,7 +712,7 @@ impl Harmonia {
             }
         } else {
             match id {
-                "none" => {
+                "none" | "use-none" => {
                     self.settings.active = None;
                     self.save();
                     self.say(
@@ -740,7 +754,7 @@ impl Harmonia {
         let name = |hash: &Option<String>| {
             hash.as_deref()
                 .and_then(|hash| self.translation(hash))
-                .map(|t| format!("{} · {}", t.title, t.language))
+                .map(|t| format!("{} · {}", language_name(&t.language, self.russian), t.title))
         };
         if self.yielded {
             return Some((
@@ -755,17 +769,42 @@ impl Harmonia {
         if self.applied != self.settings.active {
             let text = match name(&self.settings.active) {
                 Some(chosen) => words(
-                    format!("{chosen} — at the next game start"),
-                    format!("{chosen} — со следующего запуска игры"),
+                    format!("{chosen} — after a restart"),
+                    format!("{chosen} — после перезапуска"),
                 ),
                 None => words(
-                    "No translation from the next game start",
-                    "Без перевода со следующего запуска игры",
+                    "No translation after a restart",
+                    "Без перевода после перезапуска",
                 ),
             };
             return Some((text, Tone::Warning));
         }
         name(&self.applied).map(|applied| (applied, Tone::Good))
+    }
+
+    /// The one line that asks for a restart, while the game runs with
+    /// another translation than the chosen one.
+    fn restart_line(&self) -> Option<String> {
+        if self.yielded || self.applied == self.settings.active {
+            return None;
+        }
+        Some(
+            match self
+                .settings
+                .active
+                .as_deref()
+                .and_then(|h| self.translation(h))
+            {
+                Some(t) => words(
+                    format!("Restart the game to turn on {}.", t.title),
+                    format!("Перезапустите игру, чтобы включить {}.", t.title),
+                ),
+                None => words(
+                    "Restart the game to turn the translation off.",
+                    "Перезапустите игру, чтобы выключить перевод.",
+                ),
+            },
+        )
     }
 
     /// `en` or `ru`, by the language of Angelica's interface.
@@ -859,63 +898,46 @@ impl Harmonia {
         entry
     }
 
-    /// An installed translation as a row; the chosen one shows what it is
-    /// and what can be done with it.
+    /// An installed translation as a row: its version, where it stands, and
+    /// under the pointer Use; the chosen one shows what it is.
     fn translation_entry(&self, index: usize, translation: &Translation) -> Entry {
         let id = format!("row-t{index}");
         let hash = translation.hash.as_str();
         let applied = self.applied.as_deref() == Some(hash);
         let active = self.settings.active.as_deref() == Some(hash);
         let idle = self.job.is_none();
-        let mark = match (applied, active) {
-            (true, true) => Mark::On,
-            (false, false) => Mark::Off,
-            _ => Mark::Attention,
+        let (state, mark) = match (applied, active) {
+            (true, true) => (self.tr("in the game", "в игре"), Mark::On),
+            (false, true) => (
+                self.tr("after a restart", "после перезапуска"),
+                Mark::Attention,
+            ),
+            (true, false) => (self.tr("until you quit", "до выхода из игры"), Mark::Off),
+            (false, false) => ("", Mark::None),
         };
         let chosen = self.chosen.as_deref() == Some(id.as_str());
         let mut entry = Entry::new(&id, &translation.title)
-            .note(&translation.language)
-            .value(&translation.version)
+            .note(&translation.version)
+            .value(state)
             .mark(mark)
             .chosen(chosen);
+        if matches!(&self.job, Some((_, Job::Compile(compiling))) if compiling == hash) {
+            entry = entry
+                .progress(self.progress.0)
+                .value(self.tr("preparing", "подготовка"));
+        }
         if !active && idle {
             entry = entry.action(format!("use-{index}"), self.tr("Use", "Использовать"));
         }
         if !chosen {
             return entry;
         }
-        if applied != active {
-            entry = entry.fact(
-                self.tr("State", "Состояние"),
-                if active {
-                    self.tr(
-                        "Applies at the next game start.",
-                        "Применится при следующем запуске игры.",
-                    )
-                } else {
-                    self.tr(
-                        "In use until the game closes.",
-                        "Используется, пока игра не закрыта.",
-                    )
-                },
-            );
-        }
         let feed = translation.feed.as_deref();
         entry = entry
             .fact(self.tr("Team", "Команда"), &translation.team)
             .fact(
-                self.tr("Translation", "Перевод"),
-                format!(
-                    "{} ← {}, {} {}",
-                    translation.language,
-                    translation.game_language,
-                    translation.cells,
-                    self.tr("cells", "ячеек")
-                ),
-            )
-            .fact(
-                self.tr("Made for game", "Для игры"),
-                &translation.game_version,
+                self.tr("Translated", "Переведено"),
+                format!("{} {}", translation.cells, self.tr("cells", "ячеек")),
             )
             .fact(
                 self.tr("Publisher", "Издатель"),
@@ -927,13 +949,7 @@ impl Harmonia {
             .fact(
                 self.tr("Updates", "Обновления"),
                 feed.map_or_else(
-                    || {
-                        self.tr(
-                            "No link; updated from a file.",
-                            "Нет ссылки; обновляется из файла.",
-                        )
-                        .to_owned()
-                    },
+                    || self.tr("from a file", "из файла").to_owned(),
                     |url| self.feed_state(url).0,
                 ),
             );
@@ -952,7 +968,6 @@ impl Harmonia {
     ) -> Entry {
         let idle = self.job.is_none();
         let active = self.settings.active.as_deref() == Some(translation.hash.as_str());
-        let feed = translation.feed.as_deref();
         if active {
             entry = entry.more(
                 "none",
@@ -961,8 +976,10 @@ impl Harmonia {
                 idle,
             );
         }
-        if let Some(position) =
-            feed.and_then(|url| self.settings.feeds.iter().position(|f| f == url))
+        if let Some(position) = translation
+            .feed
+            .as_deref()
+            .and_then(|url| self.settings.feeds.iter().position(|f| f == url))
         {
             entry = entry.more(
                 format!("feed-remove-{position}"),
@@ -979,25 +996,35 @@ impl Harmonia {
         )
     }
 
-    /// A feed nothing is installed from yet.
+    /// A feed nothing is installed from yet: its size and Download, or how
+    /// far its download is.
     fn feed_entry(&self, index: usize, url: &str) -> Entry {
         let id = format!("row-f{index}");
-        let view = self.feeds.iter().find(|(feed, _)| feed == url);
-        let title = view
-            .and_then(|(_, view)| view.title.as_deref())
-            .unwrap_or(url);
-        let (state, problem) = self.feed_state(url);
+        let view = self
+            .feeds
+            .iter()
+            .find(|(feed, _)| feed == url)
+            .map(|(_, v)| v);
+        let title = view.and_then(|view| view.title.as_deref()).unwrap_or(url);
         let chosen = self.chosen.as_deref() == Some(id.as_str());
-        let mut entry = Entry::new(&id, title)
-            .note(state)
-            .mark(if problem { Mark::Attention } else { Mark::None })
-            .chosen(chosen);
-        let waits = self.pending.iter().any(|pending| pending.feed == url);
-        if matches!(view, Some((_, view)) if matches!(view.status, FeedStatus::Available(_)))
-            && !waits
-            && self.job.is_none()
-        {
-            entry = entry.action(format!("feed-get-{index}"), self.tr("Download", "Скачать"));
+        let mut entry = Entry::new(&id, title).chosen(chosen);
+        if self.downloading.as_deref() == Some(url) {
+            entry = entry.progress(self.progress.0).value(&self.progress.1);
+        } else {
+            match view.map(|view| &view.status) {
+                Some(FeedStatus::Available(release)) => {
+                    entry = entry.note(&release.version).value(megabytes(release.size));
+                    let waits = self.pending.iter().any(|pending| pending.feed == url);
+                    if !waits && self.job.is_none() {
+                        entry = entry
+                            .action(format!("feed-get-{index}"), self.tr("Download", "Скачать"));
+                    }
+                }
+                Some(FeedStatus::Problem(reason)) => {
+                    entry = entry.note(reason).mark(Mark::Attention);
+                }
+                _ => entry = entry.note(self.tr("checking", "проверяется")),
+            }
         }
         if chosen {
             entry = entry.fact(self.tr("Link", "Ссылка"), url).more(
@@ -1071,29 +1098,27 @@ impl Harmonia {
             .separator()
     }
 
-    /// The installed translations, in use first, then the feeds nothing is
-    /// installed from and the files waiting in the import folder.
+    /// Every translation by its language, then the game without one, then
+    /// files in the import folder.
     fn rows(&self, mut window: Window) -> Window {
-        let in_use = |t: &Translation| {
-            self.applied.as_deref() == Some(t.hash.as_str())
-                || self.settings.active.as_deref() == Some(t.hash.as_str())
-        };
-        for (used, title) in [
-            (true, self.tr("In use", "Используется")),
-            (false, self.tr("Installed", "Установлены")),
-        ] {
-            let mut first = true;
-            for (index, translation) in self.library.iter().enumerate() {
-                if in_use(translation) != used {
-                    continue;
-                }
-                if std::mem::take(&mut first) {
-                    window = window.heading(title);
-                }
-                window = window.entry(self.translation_entry(index, translation));
-            }
+        enum Row<'a> {
+            Installed(usize, &'a Translation),
+            Feed(usize, &'a str),
         }
-        let mut first = true;
+        let mut languages: Vec<(String, Vec<Row<'_>>)> = Vec::new();
+        let mut put = |language: String, row| match languages
+            .iter_mut()
+            .find(|(known, _)| *known == language)
+        {
+            Some((_, rows)) => rows.push(row),
+            None => languages.push((language, vec![row])),
+        };
+        for (index, translation) in self.library.iter().enumerate() {
+            put(
+                translation.language.clone(),
+                Row::Installed(index, translation),
+            );
+        }
         for (index, url) in self.settings.feeds.iter().enumerate() {
             if self
                 .library
@@ -1102,17 +1127,60 @@ impl Harmonia {
             {
                 continue;
             }
-            if std::mem::take(&mut first) {
-                window = window.heading(self.tr("By link", "По ссылке"));
-            }
-            window = window.entry(self.feed_entry(index, url));
+            let language = self
+                .feeds
+                .iter()
+                .find(|(feed, _)| feed == url)
+                .and_then(|(_, view)| match &view.status {
+                    FeedStatus::Available(release) => Some(release.language.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            put(language, Row::Feed(index, url));
         }
+        for (language, rows) in &languages {
+            window = window.heading(if language.is_empty() {
+                self.tr("By link", "По ссылке").to_owned()
+            } else {
+                language_name(language, self.russian)
+            });
+            for row in rows {
+                window = window.entry(match row {
+                    Row::Installed(index, translation) => {
+                        self.translation_entry(*index, translation)
+                    }
+                    Row::Feed(index, url) => self.feed_entry(*index, url),
+                });
+            }
+        }
+        let original = self
+            .library
+            .first()
+            .map(|t| language_name(&t.game_language, self.russian))
+            .unwrap_or_else(|| self.tr("The game's language", "Язык игры").to_owned());
+        let applied = self.applied.is_none();
+        let active = self.settings.active.is_none();
+        let (state, mark) = match (applied, active) {
+            (true, true) => (self.tr("in the game", "в игре"), Mark::On),
+            (false, true) => (
+                self.tr("after a restart", "после перезапуска"),
+                Mark::Attention,
+            ),
+            _ => ("", Mark::None),
+        };
+        let mut none = Entry::new("row-none", self.tr("No translation", "Без перевода"))
+            .value(state)
+            .mark(mark);
+        if !active && self.job.is_none() {
+            none = none.action("use-none", self.tr("Use", "Использовать"));
+        }
+        window = window.heading(original).entry(none);
         if !self.imports.is_empty() {
             window = window.heading(self.tr("Files", "Файлы"));
         }
         for (index, (path, size)) in self.imports.iter().enumerate() {
             let name = path.rsplit('/').next().unwrap_or(path);
-            let mut entry = Entry::new(format!("row-i{index}"), name).note(megabytes(*size));
+            let mut entry = Entry::new(format!("row-i{index}"), name).value(megabytes(*size));
             if self.job.is_none() {
                 entry = entry.action(format!("check-{index}"), self.tr("Check", "Проверить"));
             }
@@ -1120,6 +1188,57 @@ impl Harmonia {
         }
         window
     }
+
+    /// The field for a link, or the word that opens it.
+    fn link(&self, window: Window) -> Window {
+        if !self.adding {
+            return window.row(|row| {
+                row.action(
+                    "feed-open",
+                    self.tr("+ Add by link", "+ Добавить по ссылке"),
+                    ActionKind::Normal,
+                    true,
+                )
+            });
+        }
+        window
+            .input(
+                "feed",
+                "",
+                &self.feed_input,
+                self.tr("Link to a translation", "Ссылка на перевод"),
+            )
+            .row(|row| {
+                row.action(
+                    "feed-add",
+                    self.tr("Add", "Добавить"),
+                    ActionKind::Main,
+                    true,
+                )
+                .action(
+                    "feed-close",
+                    self.tr("Cancel", "Отмена"),
+                    ActionKind::Quiet,
+                    true,
+                )
+            })
+    }
+}
+
+/// A language's name in the interface's language; the code when unknown.
+fn language_name(code: &str, russian: bool) -> String {
+    let (en, ru) = match code {
+        "ru" => ("Russian", "Русский"),
+        "en" => ("English", "Английский"),
+        "ja" => ("Japanese", "Японский"),
+        "de" => ("German", "Немецкий"),
+        "fr" => ("French", "Французский"),
+        "uk" => ("Ukrainian", "Украинский"),
+        "zh" => ("Chinese", "Китайский"),
+        "ko" => ("Korean", "Корейский"),
+        _ => return code.to_owned(),
+    };
+    if russian { ru } else { en }.to_owned()
 }
 
 impl Plugin for Harmonia {
@@ -1145,6 +1264,9 @@ impl Plugin for Harmonia {
             next_check: FIRST_CHECK,
             pending: Vec::new(),
             chosen: None,
+            downloading: None,
+            adding: false,
+            since_imports: 0.0,
             russian: runtime::language() == "ru",
         };
         let _ = storage::remove(feed::DOWNLOAD);
@@ -1186,12 +1308,14 @@ impl Plugin for Harmonia {
                 }
                 jobs::State::Finished(output) => {
                     let (_, job) = self.job.take().expect("a running job");
+                    self.downloading = None;
                     if let Err(error) = self.finished(job, &output) {
                         self.say(error, Tone::Bad);
                     }
                 }
                 jobs::State::Failed(reason) => {
                     self.job = None;
+                    self.downloading = None;
                     self.say(reason, Tone::Bad);
                 }
             }
@@ -1199,6 +1323,7 @@ impl Plugin for Harmonia {
         self.since_check += elapsed;
         if self.job.is_none() {
             if let Some(input) = self.pending.pop() {
+                self.downloading = Some(input.feed.clone());
                 self.start_job("download", &input, Job::Download);
             } else if !self.settings.feeds.is_empty() && self.since_check >= self.next_check {
                 self.since_check = 0.0;
@@ -1206,6 +1331,11 @@ impl Plugin for Harmonia {
                 let feeds = self.settings.feeds.clone();
                 self.start_job("feeds", &feeds, Job::Feeds);
             }
+        }
+        self.since_imports += elapsed;
+        if self.open && self.since_imports >= 3.0 {
+            self.since_imports = 0.0;
+            self.imports = library::imports();
         }
         self.since_status += elapsed;
         if self.applied.is_some() && self.since_status >= 1.0 {
@@ -1224,6 +1354,9 @@ impl Plugin for Harmonia {
         if let Some((text, tone)) = self.status_line() {
             window = window.status(text, tone);
         }
+        if let Some(restart) = self.restart_line() {
+            window = window.toned(restart, Tone::Warning);
+        }
         if let Some(inspection) = &self.inspection {
             window = self.inspection_lines(window, inspection);
         }
@@ -1241,57 +1374,15 @@ impl Plugin for Harmonia {
                 "Harmonia in Dalamud translated the game in the previous session, so this copy stays off in this one. It translates from the next start once Harmonia in Dalamud does not run, for example while Dalamud waits for an update after a game update.",
                 "В прошлой игре перевод делала Harmonia в Dalamud, поэтому в этой игре эта копия выключена. Она начнёт переводить со следующего запуска, если Harmonia в Dalamud не запустится, например пока Dalamud ждёт обновления после обновления игры.",
             ));
-        } else if self.library.is_empty()
-            && self.settings.feeds.is_empty()
-            && self.imports.is_empty()
-        {
-            window =
-                window.muted(self.tr("No translation is installed.", "Переводы не установлены."));
-        } else if self.applied.is_none() {
-            window = window.muted(self.tr(
-                "No translation is applied in this session.",
-                "В этой игре перевод не применён.",
-            ));
         }
         window = self.rows(window);
-        if self.job.is_some() {
+        if matches!(&self.job, Some((_, job)) if !matches!(job, Job::Download | Job::Compile(_))) {
             window = window.progress(self.progress.0, &self.progress.1);
         }
         if !self.message.0.is_empty() {
             window = window.toned(&self.message.0, self.message.1);
         }
-        window = window
-            .separator()
-            .input(
-                "feed",
-                "",
-                &self.feed_input,
-                self.tr("Link to a translation", "Ссылка на перевод"),
-            )
-            .row(|row| {
-                row.action(
-                    "feed-add",
-                    self.tr("Add", "Добавить"),
-                    ActionKind::Normal,
-                    true,
-                )
-                .action(
-                    "feed-check",
-                    self.tr("Check for updates", "Проверить обновления"),
-                    ActionKind::Quiet,
-                    !self.settings.feeds.is_empty() && self.job.is_none(),
-                )
-                .action(
-                    "refresh",
-                    self.tr("Look for files", "Найти файлы"),
-                    ActionKind::Quiet,
-                    true,
-                )
-                .tooltip(self.tr(
-                    "A .hpk file goes into the import folder of Harmonia's folder: the window's menu, Open folder.",
-                    "Файл .hpk кладётся в папку import в папке Harmonia: меню окна, «Открыть папку».",
-                ))
-            });
+        window = self.link(window.separator());
         vec![window]
     }
 
