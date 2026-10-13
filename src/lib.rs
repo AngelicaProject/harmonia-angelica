@@ -155,6 +155,10 @@ struct Harmonia {
     resume: Vec<library::Download>,
     /// The pack the player chose to install, used once it is installed.
     chosen_pack: Option<String>,
+    /// The link the player just added, until its feed is read.
+    added: Option<String>,
+    /// The feed whose publisher the player is asked to trust.
+    asking: Option<String>,
     /// Whether the field for a link is shown.
     adding: bool,
     since_imports: f64,
@@ -538,7 +542,7 @@ impl Harmonia {
             .library
             .iter()
             .filter(|t| t.feed.as_deref() == Some(url.as_str()))
-            .map(|t| t.version.as_str())
+            .map(|t| t.version.clone())
             .max();
         let status = if compile::game_language(&release.game_language).is_none() {
             FeedStatus::Problem(words(
@@ -551,7 +555,7 @@ impl Harmonia {
                     release.game_language
                 ),
             ))
-        } else if !release.is_newer_than(installed) {
+        } else if !release.is_newer_than(installed.as_deref()) {
             FeedStatus::UpToDate
         } else if !release.supported_by(env!("CARGO_PKG_VERSION")) {
             FeedStatus::Problem(words(
@@ -564,7 +568,18 @@ impl Harmonia {
             }
             FeedStatus::Available(Box::new(release))
         };
+        // A link the player just added: ask whether to trust its publisher
+        // and download.
+        let ask = self.added.as_deref() == Some(url.as_str())
+            && matches!(status, FeedStatus::Available(_))
+            && installed.is_none();
         self.set_feed(&url, title, status);
+        if self.added.as_deref() == Some(url.as_str()) {
+            self.added = None;
+            if ask {
+                self.asking = Some(url);
+            }
+        }
     }
 
     fn request(&mut self, url: &str, release: &feed::Release) {
@@ -658,7 +673,8 @@ impl Harmonia {
                 Tone::Muted,
             );
         }
-        self.settings.feeds.push(url);
+        self.settings.feeds.push(url.clone());
+        self.added = Some(url);
         self.feed_input.clear();
         self.save();
         self.next_check = 0.0;
@@ -708,6 +724,16 @@ impl Harmonia {
                     }
                 }
                 "feed-open" => self.adding = true,
+                "trust" => self.trust(),
+                "distrust" => {
+                    if let Some(url) = self.asking.take()
+                        && let Some(index) = self.settings.feeds.iter().position(|f| *f == url)
+                    {
+                        self.settings.feeds.remove(index);
+                        self.feeds.retain(|(feed, _)| *feed != url);
+                        self.save();
+                    }
+                }
                 "feed-close" => {
                     self.adding = false;
                     self.feed_input.clear();
@@ -717,6 +743,86 @@ impl Harmonia {
             }
         }
         true
+    }
+
+    /// The player trusts the publisher of the feed they added: its release
+    /// downloads, installs, and is used.
+    fn trust(&mut self) {
+        let Some(url) = self.asking.take() else {
+            return;
+        };
+        let release = self
+            .feeds
+            .iter()
+            .find(|(feed, _)| *feed == url)
+            .and_then(|(_, view)| match &view.status {
+                FeedStatus::Available(release) => Some((**release).clone()),
+                _ => None,
+            });
+        if let Some(release) = release {
+            if !self.wanted.contains(&url) {
+                self.wanted.push(url.clone());
+            }
+            self.request(&url, &release);
+        }
+    }
+
+    /// The question whether to trust the publisher of a link just added.
+    fn trust_lines(&self, window: Window, url: &str) -> Window {
+        let Some((_, view)) = self.feeds.iter().find(|(feed, _)| feed == url) else {
+            return window;
+        };
+        let FeedStatus::Available(release) = &view.status else {
+            return window;
+        };
+        let title = view.title.as_deref().unwrap_or(url);
+        let language = language_name(&release.language, self.russian);
+        let mut window = window.heading(title).text(if self.russian {
+            format!(
+                "Перевод: {language}, версия {}, {}.",
+                release.version,
+                megabytes(release.size)
+            )
+        } else {
+            format!(
+                "Translation: {language}, version {}, {}.",
+                release.version,
+                megabytes(release.size)
+            )
+        });
+        window = match &view.key {
+            Some(key) => window.text(if self.russian {
+                format!("Издатель подписывает переводы ключом {}.", short(key))
+            } else {
+                format!(
+                    "The publisher signs translations with the key {}.",
+                    short(key)
+                )
+            }),
+            None => window.toned(
+                self.tr(
+                    "The feed names no publisher key: whoever made the pack cannot be checked.",
+                    "Лента не называет ключ издателя: кто сделал пак, проверить нельзя.",
+                ),
+                Tone::Warning,
+            ),
+        };
+        window
+            .row(|row| {
+                row.action(
+                    "trust",
+                    self.tr("Trust and download", "Доверять и скачать"),
+                    ActionKind::Main,
+                    true,
+                )
+                .action(
+                    "distrust",
+                    self.tr("Cancel", "Отмена"),
+                    ActionKind::Quiet,
+                    true,
+                )
+            })
+            .separator()
     }
 
     /// Installs the pack that waited for the player's decision.
@@ -1346,6 +1452,8 @@ impl Plugin for Harmonia {
             wanted: Vec::new(),
             resume: library::downloaded(),
             chosen_pack: None,
+            added: None,
+            asking: None,
             adding: false,
             since_imports: 0.0,
             russian: runtime::language() == "ru",
@@ -1453,6 +1561,9 @@ impl Plugin for Harmonia {
         }
         if let Some(restart) = self.restart_line() {
             window = window.toned(restart, Tone::Warning);
+        }
+        if let Some(url) = &self.asking {
+            window = self.trust_lines(window, url);
         }
         if let Some(inspection) = &self.inspection {
             window = self.inspection_lines(window, inspection);

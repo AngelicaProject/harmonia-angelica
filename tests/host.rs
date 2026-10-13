@@ -79,8 +79,14 @@ fn has_progress(test: &TestHost) -> bool {
 
 /// Runs frames until the running job ends.
 fn wait(test: &TestHost) {
+    wait_up_to(test, Duration::from_mins(1));
+}
+
+/// Waits for the plugin's work to end, at most `limit`.
+fn wait_up_to(test: &TestHost, limit: Duration) {
     test.frames(1);
-    for _ in 0..6000 {
+    let started = std::time::Instant::now();
+    while started.elapsed() < limit {
         if !has_progress(test) {
             return;
         }
@@ -494,7 +500,8 @@ fn a_feed_release_is_downloaded_checked_and_installed() {
     // becomes the chosen translation, and is prepared, with no second
     // decision; one restart remains.
     click(&test, "feed-get-0");
-    wait(&test);
+    // As long as the host lets a download take.
+    wait_up_to(&test, Duration::from_mins(15));
     let shown = texts(&test);
     assert!(
         shown
