@@ -68,6 +68,9 @@ struct InstallInput {
 struct Checked {
     url: String,
     title: Option<String>,
+    /// The fingerprint of the key the feed says its packs are signed with.
+    #[serde(default)]
+    key: Option<String>,
     release: Option<feed::Release>,
     error: Option<String>,
 }
@@ -76,6 +79,9 @@ struct Checked {
 struct DownloadInput {
     feed: String,
     release: feed::Release,
+    /// The key fingerprint the feed declares, kept with the downloaded pack.
+    #[serde(default)]
+    key: Option<String>,
 }
 
 enum FeedStatus {
@@ -86,6 +92,8 @@ enum FeedStatus {
 
 struct FeedView {
     title: Option<String>,
+    /// The key fingerprint the feed declares.
+    key: Option<String>,
     status: FeedStatus,
 }
 
@@ -101,7 +109,8 @@ struct CompileInput {
 }
 
 enum Job {
-    Inspect,
+    /// A pack checked again: imported by hand, or downloaded from a feed.
+    Inspect(Option<String>),
     Feeds,
     Download,
     Install,
@@ -137,8 +146,15 @@ struct Harmonia {
     pending: Vec<DownloadInput>,
     /// The id of the chosen row.
     chosen: Option<String>,
-    /// The feed whose release downloads now.
+    /// The feed whose release downloads or installs now.
     downloading: Option<String>,
+    /// The feeds the player asked to download: their release is used once
+    /// it is installed.
+    wanted: Vec<String>,
+    /// Packs a previous game downloaded and did not install.
+    resume: Vec<library::Download>,
+    /// The pack the player chose to install, used once it is installed.
+    chosen_pack: Option<String>,
     /// Whether the field for a link is shown.
     adding: bool,
     since_imports: f64,
@@ -324,7 +340,13 @@ impl Harmonia {
 
     fn finished(&mut self, job: Job, output: &[u8]) -> Result<(), String> {
         match job {
-            Job::Inspect => {
+            Job::Inspect(Some(feed)) => {
+                let mut inspection: Inspection =
+                    serde_json::from_slice(output).map_err(|e| e.to_string())?;
+                inspection.feed = Some(feed);
+                self.downloaded(inspection);
+            }
+            Job::Inspect(None) => {
                 let inspection: Inspection =
                     serde_json::from_slice(output).map_err(|e| e.to_string())?;
                 if self.translation(&inspection.translation.hash).is_some() {
@@ -435,6 +457,17 @@ impl Harmonia {
             }
             self.set_feed(url, None, FeedStatus::UpToDate);
         }
+        if let Some(url) = &translation.feed
+            && let Some(at) = self.wanted.iter().position(|wanted| wanted == url)
+        {
+            self.wanted.remove(at);
+            chosen = true;
+        }
+        if self.chosen_pack.as_deref() == Some(translation.hash.as_str()) {
+            self.chosen_pack = None;
+            chosen = true;
+        }
+        library::forget_download(&translation.hash);
         let hash = translation.hash.clone();
         self.library.push(translation);
         self.imports = library::imports();
@@ -454,8 +487,14 @@ impl Harmonia {
                 view.title = title;
             }
         } else {
-            self.feeds
-                .push((url.to_owned(), FeedView { title, status }));
+            self.feeds.push((
+                url.to_owned(),
+                FeedView {
+                    title,
+                    key: None,
+                    status,
+                },
+            ));
         }
     }
 
@@ -466,11 +505,16 @@ impl Harmonia {
         let Checked {
             url,
             title,
+            key,
             release,
             error,
         } = checked;
         if !self.settings.feeds.contains(&url) {
             return;
+        }
+        self.set_feed(&url, None, FeedStatus::UpToDate);
+        if let Some((_, view)) = self.feeds.iter_mut().find(|(feed, _)| *feed == url) {
+            view.key = key;
         }
         let Some(release) = release else {
             let reason = error.unwrap_or_else(|| {
@@ -525,9 +569,15 @@ impl Harmonia {
 
     fn request(&mut self, url: &str, release: &feed::Release) {
         if !self.pending.iter().any(|pending| pending.feed == url) {
+            let key = self
+                .feeds
+                .iter()
+                .find(|(feed, _)| feed == url)
+                .and_then(|(_, view)| view.key.clone());
             self.pending.push(DownloadInput {
                 feed: url.to_owned(),
                 release: release.clone(),
+                key,
             });
         }
     }
@@ -547,17 +597,31 @@ impl Harmonia {
                 Tone::Muted,
             );
         }
-        let trusted = translation.key.is_some()
-            && self
-                .library
+        let declared = inspection.feed.as_deref().and_then(|url| {
+            self.feeds
                 .iter()
-                .any(|old| old.feed == inspection.feed && old.key == translation.key);
+                .find(|(feed, _)| feed == url)
+                .and_then(|(_, view)| view.key.clone())
+        });
+        // The player chose this publisher when adding the link; a pack signed
+        // with the key its feed declares, or with the key of the translation
+        // the feed installed before, needs no second decision.
+        let trusted = translation.key.as_ref().is_some_and(|key| {
+            declared
+                .as_ref()
+                .is_some_and(|declared| declared.eq_ignore_ascii_case(key))
+                || self
+                    .library
+                    .iter()
+                    .any(|old| old.feed == inspection.feed && old.key.as_ref() == Some(key))
+        });
         if trusted {
             let input = InstallInput {
                 path: inspection.path.clone(),
                 hash: translation.hash.clone(),
                 feed: inspection.feed.clone(),
             };
+            self.downloading.clone_from(&inspection.feed);
             self.start_job("install", &input, Job::Install);
         } else {
             self.say(
@@ -603,9 +667,11 @@ impl Harmonia {
     /// Drops what waits for the player; a downloaded pack is removed.
     fn cancel_inspection(&mut self) {
         if let Some(inspection) = self.inspection.take()
-            && inspection.feed.is_some()
+            && let Some(feed) = &inspection.feed
         {
             let _ = storage::remove(&inspection.path);
+            library::forget_download(&inspection.translation.hash);
+            self.wanted.retain(|wanted| wanted != feed);
         }
     }
 
@@ -628,6 +694,9 @@ impl Harmonia {
             {
                 let release = (**release).clone();
                 self.cancel_inspection();
+                if !self.wanted.contains(&url) {
+                    self.wanted.push(url.clone());
+                }
                 self.request(&url, &release);
             }
         } else {
@@ -650,6 +719,33 @@ impl Harmonia {
         true
     }
 
+    /// Installs the pack that waited for the player's decision.
+    fn install_inspected(&mut self) {
+        if self.job.is_some() {
+            self.say(
+                words(
+                    "Wait for the running task to finish.",
+                    "Дождитесь конца текущей задачи.",
+                ),
+                Tone::Warning,
+            );
+        } else if let Some(inspection) = self.inspection.take() {
+            self.chosen_pack = Some(inspection.translation.hash.clone());
+            self.downloading.clone_from(&inspection.feed);
+            if let Some(feed) = &inspection.feed
+                && !self.wanted.contains(feed)
+            {
+                self.wanted.push(feed.clone());
+            }
+            let input = InstallInput {
+                path: inspection.path,
+                hash: inspection.translation.hash,
+                feed: inspection.feed,
+            };
+            self.start_job("install", &input, Job::Install);
+        }
+    }
+
     fn click(&mut self, id: &str) {
         if id.starts_with("row-") {
             self.chosen = if self.chosen.as_deref() == Some(id) {
@@ -668,7 +764,7 @@ impl Harmonia {
         {
             if let Some((path, _)) = self.imports.get(index).cloned() {
                 self.cancel_inspection();
-                self.start_job("inspect", &path, Job::Inspect);
+                self.start_job("inspect", &path, Job::Inspect(None));
             }
         } else if let Some(index) = id
             .strip_prefix("use-")
@@ -724,24 +820,7 @@ impl Harmonia {
                     );
                 }
                 "refresh" => self.imports = library::imports(),
-                "install" => {
-                    if self.job.is_some() {
-                        self.say(
-                            words(
-                                "Wait for the running task to finish.",
-                                "Дождитесь конца текущей задачи.",
-                            ),
-                            Tone::Warning,
-                        );
-                    } else if let Some(inspection) = self.inspection.take() {
-                        let input = InstallInput {
-                            path: inspection.path,
-                            hash: inspection.translation.hash,
-                            feed: inspection.feed,
-                        };
-                        self.start_job("install", &input, Job::Install);
-                    }
-                }
+                "install" => self.install_inspected(),
                 "cancel" => self.cancel_inspection(),
                 _ => {}
             }
@@ -1153,11 +1232,10 @@ impl Harmonia {
                 });
             }
         }
-        let original = self
-            .library
-            .first()
-            .map(|t| language_name(&t.game_language, self.russian))
-            .unwrap_or_else(|| self.tr("The game's language", "Язык игры").to_owned());
+        let original = self.library.first().map_or_else(
+            || self.tr("The game's language", "Язык игры").to_owned(),
+            |t| language_name(&t.game_language, self.russian),
+        );
         let applied = self.applied.is_none();
         let active = self.settings.active.is_none();
         let (state, mark) = match (applied, active) {
@@ -1265,6 +1343,9 @@ impl Plugin for Harmonia {
             pending: Vec::new(),
             chosen: None,
             downloading: None,
+            wanted: Vec::new(),
+            resume: library::downloaded(),
+            chosen_pack: None,
             adding: false,
             since_imports: 0.0,
             russian: runtime::language() == "ru",
@@ -1322,7 +1403,23 @@ impl Plugin for Harmonia {
         }
         self.since_check += elapsed;
         if self.job.is_none() {
-            if let Some(input) = self.pending.pop() {
+            if let Some(download) = self.resume.pop() {
+                let library::Download { path, feed, key } = download;
+                if !self.wanted.contains(&feed) {
+                    self.wanted.push(feed.clone());
+                }
+                // The feed is checked later; its key came with the pack.
+                if self.feeds.iter().all(|(known, _)| *known != feed) {
+                    self.set_feed(&feed, None, FeedStatus::UpToDate);
+                }
+                if let Some((_, view)) = self.feeds.iter_mut().find(|(known, _)| *known == feed)
+                    && view.key.is_none()
+                {
+                    view.key = key;
+                }
+                self.downloading = Some(feed.clone());
+                self.start_job("inspect", &path, Job::Inspect(Some(feed)));
+            } else if let Some(input) = self.pending.pop() {
                 self.downloading = Some(input.feed.clone());
                 self.start_job("download", &input, Job::Download);
             } else if !self.settings.feeds.is_empty() && self.since_check >= self.next_check {
@@ -1538,11 +1635,13 @@ fn check_feed(url: String) -> Checked {
             url,
             release: feed.newest().cloned(),
             title: feed.title,
+            key: feed.key,
             error: None,
         },
         Err(error) => Checked {
             url,
             title: None,
+            key: None,
             release: None,
             error: Some(error),
         },
@@ -1573,6 +1672,7 @@ fn download(input: &DownloadInput) -> Result<Inspection, String> {
     inspection.feed = Some(input.feed.clone());
     let _ = jobs::report(0.9, &words("Saving", "Сохранение"));
     storage::write(&path, &bytes).map_err(|e| e.message)?;
+    library::remember_download(&release.pack_hash, &input.feed, input.key.as_deref())?;
     Ok(inspection)
 }
 

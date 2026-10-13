@@ -69,7 +69,12 @@ fn has_progress(test: &TestHost) -> bool {
     test.host.plugin("harmonia").unwrap().windows()[0]
         .widgets
         .iter()
-        .any(|widget| matches!(widget, Widget::Progress(_)))
+        .any(|widget| match widget {
+            Widget::Progress(_) => true,
+            // A row shows the work on its own translation or feed.
+            Widget::Entry(entry) => entry.progress.is_some(),
+            _ => false,
+        })
 }
 
 /// Runs frames until the running job ends.
@@ -132,19 +137,11 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
         "{:?}",
         texts(&test)
     );
+    // Installing is choosing: the pack becomes the translation in use and is
+    // prepared, with no separate Use.
     click(&test, "install");
     wait(&test);
-    assert!(
-        texts(&test)
-            .iter()
-            .any(|t| t == "Installed Interop test pack 2026.10.01.0001."),
-        "{:?}",
-        texts(&test)
-    );
     assert!(!import.join("interop.hpk").exists());
-
-    click(&test, "use-0");
-    wait(&test);
     let shown = texts(&test);
     assert!(
         shown
@@ -152,7 +149,7 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
             .any(|t| t.starts_with("Ready; it applies at the next game start.")),
         "{shown:?}"
     );
-    assert!(shown.contains(&"No translation is applied in this session.".to_owned()));
+    assert!(shown.contains(&"Restart the game to turn on Interop test pack.".to_owned()));
 
     // The next game start.
     let folder = test.folder;
@@ -399,8 +396,6 @@ fn a_pack_with_fonts_replaces_the_games_font_files_at_the_next_start() {
     wait(&test);
     click(&test, "install");
     wait(&test);
-    click(&test, "use-0");
-    wait(&test);
     assert!(
         texts(&test).iter().any(|t| t.starts_with("Ready")),
         "{:?}",
@@ -435,6 +430,39 @@ fn a_pack_with_fonts_replaces_the_games_font_files_at_the_next_start() {
 /// The whole path from a feed link to an installed translation, against a
 /// feed published on the network.
 #[test]
+fn a_pack_a_previous_game_downloaded_is_picked_up_at_the_next_start() {
+    let mut test = TestHost::new(Limits::default());
+    let downloads = test.folder.path().join("storage/harmonia/downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    std::fs::copy(INTEROP, downloads.join("pack.hpk")).unwrap();
+    std::fs::write(
+        downloads.join("pack.json"),
+        r#"{"feed": "https://example.org/feed-v1.json", "key": null}"#,
+    )
+    .unwrap();
+    start(&mut test);
+    wait(&test);
+    // Its feed declared no key, so the player decides; the pack is not lost.
+    let shown = texts(&test);
+    assert!(
+        shown
+            .iter()
+            .any(|t| t.starts_with("Aeria tests — ru translation from en")),
+        "{shown:?}"
+    );
+    click(&test, "install");
+    wait(&test);
+    let shown = texts(&test);
+    assert!(
+        shown
+            .iter()
+            .any(|t| t == "Restart the game to turn on Interop test pack."),
+        "{shown:?}"
+    );
+    assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 0);
+}
+
+#[test]
 #[ignore = "needs the network and a feed link in HARMONIA_FEED"]
 fn a_feed_release_is_downloaded_checked_and_installed() {
     let feed = std::env::var("HARMONIA_FEED").unwrap();
@@ -453,27 +481,36 @@ fn a_feed_release_is_downloaded_checked_and_installed() {
     );
     click(&test, "feed-add");
     wait(&test);
+    // The feed's row: its newest version, and its size to download.
     let shown = texts(&test);
     assert!(
-        shown.iter().any(|t| t.ends_with("is available.")),
+        shown
+            .iter()
+            .any(|t| t.starts_with("20") && t.matches('.').count() == 3),
         "{shown:?}"
     );
 
+    // One Download: the pack signed with the key the feed declares installs,
+    // becomes the chosen translation, and is prepared, with no second
+    // decision; one restart remains.
     click(&test, "feed-get-0");
     wait(&test);
     let shown = texts(&test);
     assert!(
-        shown.iter().any(|t| t.starts_with("Signed by key ")),
+        shown
+            .iter()
+            .any(|t| t.starts_with("Restart the game to turn on ")),
         "{shown:?}"
     );
-
-    click(&test, "install");
-    wait(&test);
-    let shown = texts(&test);
     assert!(
-        shown.iter().any(|t| t.starts_with("Installed ")),
+        !shown.iter().any(|t| t.starts_with("Signed by key ")),
         "{shown:?}"
     );
+    let settings: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(test.folder.path().join("storage/harmonia/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(settings["active"].is_string(), "{settings}");
     click(&test, "row-t0");
     test.frames(1);
     let shown = texts(&test);
