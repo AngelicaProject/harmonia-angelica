@@ -36,14 +36,16 @@ pub mod pack;
 
 use angelica_sdk::{
     Plugin,
-    api::{excel_text, file_replacements, game_files, jobs, runtime, storage, text_case},
-    http,
+    api::{file_replacements, game_files, jobs, runtime, storage},
+    http, lens,
     ui::{ActionKind, Entry, Event, Mark, Tone, Window},
 };
 use library::{Settings, Stamp, Translation};
 use serde::{Deserialize, Serialize};
 
-const TABLE: &str = "translation";
+/// The map's event of a text cell of a row the game builds, whose rules
+/// the translation's table holds.
+const SHEET_TEXT: &str = "sheet_text";
 const WINDOW: &str = "main";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,8 +135,12 @@ struct Harmonia {
     job: Option<(u64, Job)>,
     progress: (f32, String),
     message: (String, Tone),
-    status: Option<excel_text::TableStatus>,
+    status: Option<lens::DecisionStatus>,
     since_status: f64,
+    /// The applied translation's table, as rules for the game's sheet text.
+    table: Option<lens::RuleFile>,
+    /// The rules that give the game's case conversion Cyrillic letters.
+    letters: Vec<lens::Rule>,
     /// Font files served in this session.
     fonts: usize,
     /// What the last check found, by feed link.
@@ -230,18 +236,20 @@ impl Harmonia {
             self.compile(hash);
             return Ok(());
         }
-        let info =
-            excel_text::activate(TABLE, &library::table_path(hash), 0).map_err(|e| e.message)?;
+        let table =
+            lens::RuleFile::new(SHEET_TEXT, &library::table_path(hash)).map_err(|e| e.message)?;
+        let (cells, sheets) = (table.info().rules, table.info().parts);
+        self.table = Some(table);
         self.applied = Some(hash.to_owned());
         self.say(
             words(
                 format!(
                     "{} {}: {} cells in {} sheets ready; the game translates them as it loads its text.",
-                    translation.title, translation.version, info.cells, info.sheets
+                    translation.title, translation.version, cells, sheets
                 ),
                 format!(
                     "{} {}: готово ячеек: {}, листов: {}; игра переводит их, когда загружает текст.",
-                    translation.title, translation.version, info.cells, info.sheets
+                    translation.title, translation.version, cells, sheets
                 ),
             ),
             Tone::Good,
@@ -249,21 +257,36 @@ impl Harmonia {
         if let Ok(Some(stamp)) = library::load_stamp(hash) {
             self.replace_fonts(&stamp);
         }
-        if compile::is_cyrillic(&translation.language) {
-            let letters: Vec<_> = compile::cyrillic_letters()
-                .into_iter()
-                .map(|(lower, upper)| text_case::Letter { lower, upper })
-                .collect();
-            if let Err(error) = text_case::set_letters(&letters) {
-                self.say(
-                    words(
-                        format!("Capital letters stay lowercase: {}", error.message),
-                        format!("Заглавные буквы останутся строчными: {}", error.message),
-                    ),
-                    Tone::Warning,
-                );
-            }
+        if compile::is_cyrillic(&translation.language)
+            && let Err(error) = self.add_letters()
+        {
+            self.say(
+                words(
+                    format!("Capital letters stay lowercase: {}", error.message),
+                    format!("Заглавные буквы останутся строчными: {}", error.message),
+                ),
+                Tone::Warning,
+            );
         }
+        Ok(())
+    }
+
+    /// Gives the game's case conversion the Cyrillic letters, both ways.
+    fn add_letters(&mut self) -> Result<(), angelica_sdk::Error> {
+        let mut rules = Vec::new();
+        for (small, capital) in compile::cyrillic_letters() {
+            rules.push(lens::Rule::with(
+                &format!("letter_upper[letter = \"{small}\"]"),
+                "becomes",
+                capital.to_string(),
+            )?);
+            rules.push(lens::Rule::with(
+                &format!("letter_lower[letter = \"{capital}\"]"),
+                "becomes",
+                small.to_string(),
+            )?);
+        }
+        self.letters = rules;
         Ok(())
     }
 
@@ -1034,36 +1057,37 @@ impl Harmonia {
                 self.tr("Translated so far", "Переведено в этой игре"),
                 if self.russian {
                     format!(
-                        "строк: {}, ячеек: {}. Оставлено как в игре, потому что текст игры изменился: {}.",
-                        status.rows_changed, status.cells_replaced, status.guard_mismatches
+                        "ячеек: {}. Оставлено как в игре, потому что текст игры изменился: {}.",
+                        status.taken, status.stale
                     )
                 } else {
                     format!(
-                        "{} rows, {} cells. Left in the original because the game's text changed: {}.",
-                        status.rows_changed, status.cells_replaced, status.guard_mismatches
+                        "{} cells. Left in the original because the game's text changed: {}.",
+                        status.taken, status.stale
                     )
                 },
             );
-            if status.rows_refused > 0 {
+            if status.refused > 0 {
                 entry = entry.fact(
                     self.tr("Left untouched", "Не тронуто"),
                     if self.russian {
-                        format!("строк с неожиданным устройством: {}.", status.rows_refused)
+                        format!("строк с неожиданным устройством: {}.", status.refused)
                     } else {
-                        format!("{} rows with an unexpected layout.", status.rows_refused)
+                        format!("{} rows with an unexpected layout.", status.refused)
                     },
                 );
             }
-            if !status.sheets_mismatched.is_empty() {
+            if !status.mismatched.is_empty() {
+                // Each is the sheet's name, a colon, and why.
                 let names: Vec<_> = status
-                    .sheets_mismatched
+                    .mismatched
                     .iter()
                     .take(8)
-                    .map(|m| m.sheet.as_str())
+                    .map(|line| line.split(':').next().unwrap_or(line))
                     .collect();
                 entry = entry.fact(
                     self.tr("Differ in this game build", "Отличаются в этой сборке игры"),
-                    format!("{} ({})", status.sheets_mismatched.len(), names.join(", ")),
+                    format!("{} ({})", status.mismatched.len(), names.join(", ")),
                 );
             }
         }
@@ -1441,6 +1465,8 @@ impl Plugin for Harmonia {
             message: (String::new(), Tone::Muted),
             status: None,
             since_status: f64::INFINITY,
+            table: None,
+            letters: Vec::new(),
             fonts: 0,
             feeds: Vec::new(),
             feed_input: String::new(),
@@ -1545,7 +1571,7 @@ impl Plugin for Harmonia {
         self.since_status += elapsed;
         if self.applied.is_some() && self.since_status >= 1.0 {
             self.since_status = 0.0;
-            self.status = excel_text::status(TABLE).ok();
+            self.status = self.table.as_ref().and_then(|table| table.decisions().ok());
         }
         Ok(())
     }

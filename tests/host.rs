@@ -20,7 +20,98 @@ fn component() -> &'static [u8] {
     COMPONENT.get_or_init(|| build_component_in(Path::new(env!("CARGO_MANIFEST_DIR")), "harmonia"))
 }
 
+/// The game map's events Harmonia decides at: the game's sheet text and
+/// its letter case conversions.
+const TEXT_MAP: [(&str, &str); 4] = [
+    (
+        "entries/excel.toml",
+        r#"
+[function."excel.hash_table_page_row_resolver.store_row"]
+locator = { signature = "C3" }
+abi = { args = ["ptr", "ptr", "ptr"], ret = "u8" }
+thread = "any"
+"#,
+    ),
+    (
+        "entries/text.toml",
+        r#"
+[function."text.utf8_string.to_upper"]
+locator = { signature = "C3" }
+abi = { args = ["ptr", "u8", "u8", "u8", "ptr"], ret = "ptr" }
+thread = "any"
+
+[function."text.utf8_string.to_lower"]
+locator = { signature = "C3" }
+abi = { args = ["ptr"], ret = "ptr" }
+thread = "any"
+"#,
+    ),
+    (
+        "domains.toml",
+        r#"
+[domains.text]
+doc = "The game's text."
+class = "display"
+read = { en = "Sees the game's text", ru = "Видит тексты игры" }
+change = { en = "Changes the game's text", ru = "Меняет тексты игры" }
+"#,
+    ),
+    (
+        "events.toml",
+        r#"
+[events.sheet_text]
+doc = "A text cell of a sheet row the game builds."
+at = "excel.hash_table_page_row_resolver.store_row"
+derived = "sheet_cell"
+domain = "text"
+rules = "text-table-v1"
+
+[events.sheet_text.args.sheet]
+doc = "The sheet."
+from = "sheet"
+text = 256
+
+[events.sheet_text.outcomes.replace]
+doc = "The cell shows the rule's text."
+text = 65535
+
+[events.letter_upper]
+doc = "A letter the conversion to capitals meets."
+at = "text.utf8_string.to_upper"
+derived = "case_letter"
+domain = "text"
+
+[events.letter_upper.args.letter]
+doc = "The letter."
+from = "letter"
+text = 4
+
+[events.letter_upper.outcomes.becomes]
+doc = "The rule's letter."
+text = 4
+same_length = "letter"
+
+[events.letter_lower]
+doc = "A letter the conversion to small letters meets."
+at = "text.utf8_string.to_lower"
+derived = "case_letter"
+domain = "text"
+
+[events.letter_lower.args.letter]
+doc = "The letter."
+from = "letter"
+text = 4
+
+[events.letter_lower.outcomes.becomes]
+doc = "The rule's letter."
+text = 4
+same_length = "letter"
+"#,
+    ),
+];
+
 fn start(test: &mut TestHost) {
+    test.use_map(&TEXT_MAP, &[]);
     test.install(MANIFEST, component()).unwrap();
     test.host.start_all();
     if test.host.plugin("harmonia").unwrap().status() == Status::AwaitingApproval {
@@ -212,7 +303,7 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
     assert!(
         texts(&test)
             .iter()
-            .any(|t| t.starts_with("Translated so far: 2 rows, 3 cells.")),
+            .any(|t| t.starts_with("Translated so far: 3 cells.")),
         "{:?}",
         texts(&test)
     );

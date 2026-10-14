@@ -12,8 +12,6 @@ authors = ["pokeda"]
 memory_bytes = 1073741824
 
 [permissions]
-"excel.text" = true
-"text.case" = true
 "files.replace" = true
 "http.get" = true
 
@@ -21,3 +19,7 @@ memory_bytes = 1073741824
 # the hosts GitHub serves release files from.
 [http]
 hosts = ["*.github.io", "github.com", "*.githubusercontent.com"]
+
+# The game's sheet text, from the translation's table, and letter case.
+[lens]
+change = ["text"]
