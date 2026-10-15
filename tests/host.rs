@@ -20,7 +20,98 @@ fn component() -> &'static [u8] {
     COMPONENT.get_or_init(|| build_component_in(Path::new(env!("CARGO_MANIFEST_DIR")), "harmonia"))
 }
 
+/// The game map's events Harmonia decides at: the game's sheet text and
+/// its letter case conversions.
+const TEXT_MAP: [(&str, &str); 4] = [
+    (
+        "entries/excel.toml",
+        r#"
+[function."excel.hash_table_page_row_resolver.store_row"]
+locator = { signature = "C3" }
+abi = { args = ["ptr", "ptr", "ptr"], ret = "u8" }
+thread = "any"
+"#,
+    ),
+    (
+        "entries/text.toml",
+        r#"
+[function."text.utf8_string.to_upper"]
+locator = { signature = "C3" }
+abi = { args = ["ptr", "u8", "u8", "u8", "ptr"], ret = "ptr" }
+thread = "any"
+
+[function."text.utf8_string.to_lower"]
+locator = { signature = "C3" }
+abi = { args = ["ptr"], ret = "ptr" }
+thread = "any"
+"#,
+    ),
+    (
+        "domains.toml",
+        r#"
+[domains.text]
+doc = "The game's text."
+class = "display"
+read = { en = "Sees the game's text", ru = "Видит тексты игры" }
+change = { en = "Changes the game's text", ru = "Меняет тексты игры" }
+"#,
+    ),
+    (
+        "events.toml",
+        r#"
+[events.sheet_text]
+doc = "A text cell of a sheet row the game builds."
+at = "excel.hash_table_page_row_resolver.store_row"
+derived = "sheet_cell"
+domain = "text"
+rules = "text-table-v1"
+
+[events.sheet_text.args.sheet]
+doc = "The sheet."
+from = "sheet"
+text = 256
+
+[events.sheet_text.outcomes.replace]
+doc = "The cell shows the rule's text."
+text = 65535
+
+[events.letter_upper]
+doc = "A letter the conversion to capitals meets."
+at = "text.utf8_string.to_upper"
+derived = "case_letter"
+domain = "text"
+
+[events.letter_upper.args.letter]
+doc = "The letter."
+from = "letter"
+text = 4
+
+[events.letter_upper.outcomes.becomes]
+doc = "The rule's letter."
+text = 4
+same_length = "letter"
+
+[events.letter_lower]
+doc = "A letter the conversion to small letters meets."
+at = "text.utf8_string.to_lower"
+derived = "case_letter"
+domain = "text"
+
+[events.letter_lower.args.letter]
+doc = "The letter."
+from = "letter"
+text = 4
+
+[events.letter_lower.outcomes.becomes]
+doc = "The rule's letter."
+text = 4
+same_length = "letter"
+"#,
+    ),
+];
+
 fn start(test: &mut TestHost) {
+    test.use_map(&TEXT_MAP, &[]);
     test.install(MANIFEST, component()).unwrap();
     test.host.start_all();
     if test.host.plugin("harmonia").unwrap().status() == Status::AwaitingApproval {
@@ -69,13 +160,24 @@ fn has_progress(test: &TestHost) -> bool {
     test.host.plugin("harmonia").unwrap().windows()[0]
         .widgets
         .iter()
-        .any(|widget| matches!(widget, Widget::Progress(_)))
+        .any(|widget| match widget {
+            Widget::Progress(_) => true,
+            // A row shows the work on its own translation or feed.
+            Widget::Entry(entry) => entry.progress.is_some(),
+            _ => false,
+        })
 }
 
 /// Runs frames until the running job ends.
 fn wait(test: &TestHost) {
+    wait_up_to(test, Duration::from_mins(1));
+}
+
+/// Waits for the plugin's work to end, at most `limit`.
+fn wait_up_to(test: &TestHost, limit: Duration) {
     test.frames(1);
-    for _ in 0..6000 {
+    let started = std::time::Instant::now();
+    while started.elapsed() < limit {
         if !has_progress(test) {
             return;
         }
@@ -132,19 +234,11 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
         "{:?}",
         texts(&test)
     );
+    // Installing is choosing: the pack becomes the translation in use and is
+    // prepared, with no separate Use.
     click(&test, "install");
     wait(&test);
-    assert!(
-        texts(&test)
-            .iter()
-            .any(|t| t == "Installed Interop test pack 2026.10.01.0001."),
-        "{:?}",
-        texts(&test)
-    );
     assert!(!import.join("interop.hpk").exists());
-
-    click(&test, "use-0");
-    wait(&test);
     let shown = texts(&test);
     assert!(
         shown
@@ -152,7 +246,7 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
             .any(|t| t.starts_with("Ready; it applies at the next game start.")),
         "{shown:?}"
     );
-    assert!(shown.contains(&"No translation is applied in this session.".to_owned()));
+    assert!(shown.contains(&"Restart the game to turn on Interop test pack.".to_owned()));
 
     // The next game start.
     let folder = test.folder;
@@ -209,7 +303,7 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
     assert!(
         texts(&test)
             .iter()
-            .any(|t| t.starts_with("Translated so far: 2 rows, 3 cells.")),
+            .any(|t| t.starts_with("Translated so far: 3 cells.")),
         "{:?}",
         texts(&test)
     );
@@ -399,8 +493,6 @@ fn a_pack_with_fonts_replaces_the_games_font_files_at_the_next_start() {
     wait(&test);
     click(&test, "install");
     wait(&test);
-    click(&test, "use-0");
-    wait(&test);
     assert!(
         texts(&test).iter().any(|t| t.starts_with("Ready")),
         "{:?}",
@@ -435,6 +527,39 @@ fn a_pack_with_fonts_replaces_the_games_font_files_at_the_next_start() {
 /// The whole path from a feed link to an installed translation, against a
 /// feed published on the network.
 #[test]
+fn a_pack_a_previous_game_downloaded_is_picked_up_at_the_next_start() {
+    let mut test = TestHost::new(Limits::default());
+    let downloads = test.folder.path().join("storage/harmonia/downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    std::fs::copy(INTEROP, downloads.join("pack.hpk")).unwrap();
+    std::fs::write(
+        downloads.join("pack.json"),
+        r#"{"feed": "https://example.org/feed-v1.json", "key": null}"#,
+    )
+    .unwrap();
+    start(&mut test);
+    wait(&test);
+    // Its feed declared no key, so the player decides; the pack is not lost.
+    let shown = texts(&test);
+    assert!(
+        shown
+            .iter()
+            .any(|t| t.starts_with("Aeria tests — ru translation from en")),
+        "{shown:?}"
+    );
+    click(&test, "install");
+    wait(&test);
+    let shown = texts(&test);
+    assert!(
+        shown
+            .iter()
+            .any(|t| t == "Restart the game to turn on Interop test pack."),
+        "{shown:?}"
+    );
+    assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 0);
+}
+
+#[test]
 #[ignore = "needs the network and a feed link in HARMONIA_FEED"]
 fn a_feed_release_is_downloaded_checked_and_installed() {
     let feed = std::env::var("HARMONIA_FEED").unwrap();
@@ -453,27 +578,37 @@ fn a_feed_release_is_downloaded_checked_and_installed() {
     );
     click(&test, "feed-add");
     wait(&test);
+    // The feed's row: its newest version, and its size to download.
     let shown = texts(&test);
     assert!(
-        shown.iter().any(|t| t.ends_with("is available.")),
+        shown
+            .iter()
+            .any(|t| t.starts_with("20") && t.matches('.').count() == 3),
         "{shown:?}"
     );
 
+    // One Download: the pack signed with the key the feed declares installs,
+    // becomes the chosen translation, and is prepared, with no second
+    // decision; one restart remains.
     click(&test, "feed-get-0");
-    wait(&test);
+    // As long as the host lets a download take.
+    wait_up_to(&test, Duration::from_mins(15));
     let shown = texts(&test);
     assert!(
-        shown.iter().any(|t| t.starts_with("Signed by key ")),
+        shown
+            .iter()
+            .any(|t| t.starts_with("Restart the game to turn on ")),
         "{shown:?}"
     );
-
-    click(&test, "install");
-    wait(&test);
-    let shown = texts(&test);
     assert!(
-        shown.iter().any(|t| t.starts_with("Installed ")),
+        !shown.iter().any(|t| t.starts_with("Signed by key ")),
         "{shown:?}"
     );
+    let settings: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(test.folder.path().join("storage/harmonia/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(settings["active"].is_string(), "{settings}");
     click(&test, "row-t0");
     test.frames(1);
     let shown = texts(&test);

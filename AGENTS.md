@@ -5,7 +5,7 @@ Harmonia as an Angelica plugin: a Rust crate built as a `wasm32-wasip2` componen
 ## Layout
 
 - `src/pack.rs` reads and fully verifies packs: digest, signature, every record and string (the same rules as HarmoniaEngine's `Packs/Hpk/`; the format belongs to Aeria).
-- `src/compile.rs` turns a pack into an Angelica text table; the host applies it to every row the game builds, with the layout, client language, and source guard checks.
+- `src/compile.rs` turns a pack into an Angelica text table, the rule file of the game map's `sheet_text` event (`lens.decide-file`, under the `text` domain); the host applies its rules to every row the game builds, with the layout, client language, and source guard checks. Cyrillic letter case is rules at `letter_upper` and `letter_lower`.
 - `src/library.rs` keeps installed translations, settings, and the session count in the plugin's storage.
 - `src/fonts.rs`, `src/fdt.rs`, `src/atlas.rs`, and `src/font_patch.rs` port HarmoniaEngine's font glyph rules (the same sets, candidate pages, packing, and Shift-JIS codes) onto the game's files read through Angelica. The host serves the patched files and checks them against the game's originals; prepared files are made again when the game version changes.
 - `src/feed.rs` reads feeds (the same rules as HarmoniaEngine's `Feeds/FeedDocument.cs`) and checks a downloaded release against its feed entry.

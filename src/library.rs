@@ -213,6 +213,71 @@ pub fn imports() -> Vec<(String, u64)> {
         .unwrap_or_default()
 }
 
+/// A pack in `downloads/` that a game downloaded and did not install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Download {
+    pub path: String,
+    /// The feed it came from.
+    pub feed: String,
+    /// The key fingerprint that feed declares.
+    pub key: Option<String>,
+}
+
+/// Records the feed a pack in `downloads/` came from and the key it
+/// declares, so a pack a game downloaded and did not install is picked up
+/// at the next start.
+///
+/// # Errors
+/// When the record cannot be written.
+pub fn remember_download(hash: &str, feed: &str, key: Option<&str>) -> Result<(), String> {
+    let record = serde_json::json!({ "feed": feed, "key": key }).to_string();
+    storage::write(&format!("downloads/{hash}.json"), record.as_bytes()).map_err(|e| e.message)
+}
+
+/// Forgets a downloaded pack: the pack if it is still there, and every
+/// record whose pack is gone.
+pub fn forget_download(hash: &str) {
+    let _ = storage::remove(&format!("downloads/{hash}.hpk"));
+    let Ok(entries) = storage::list("downloads") else {
+        return;
+    };
+    let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
+    for record in names.iter().filter_map(|name| name.strip_suffix(".json")) {
+        if !names.iter().any(|name| *name == format!("{record}.hpk")) {
+            let _ = storage::remove(&format!("downloads/{record}.json"));
+        }
+    }
+}
+
+/// The packs in `downloads/` that a record names a feed for.
+#[must_use]
+pub fn downloaded() -> Vec<Download> {
+    #[derive(Deserialize)]
+    struct Record {
+        feed: String,
+        #[serde(default)]
+        key: Option<String>,
+    }
+    let Ok(entries) = storage::list("downloads") else {
+        return Vec::new();
+    };
+    let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
+    names
+        .iter()
+        .filter_map(|name| name.strip_suffix(".json"))
+        .filter(|hash| names.iter().any(|name| *name == format!("{hash}.hpk")))
+        .filter_map(|hash| {
+            let bytes = storage::read(&format!("downloads/{hash}.json")).ok()?;
+            let record: Record = serde_json::from_slice(&bytes).ok()?;
+            Some(Download {
+                path: format!("downloads/{hash}.hpk"),
+                feed: record.feed,
+                key: record.key,
+            })
+        })
+        .collect()
+}
+
 /// Reads a whole file in ranges.
 ///
 /// # Errors
