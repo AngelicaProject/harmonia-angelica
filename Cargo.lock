@@ -67,6 +67,7 @@ dependencies = [
  "angelica-map",
  "angelica-sqpack",
  "angelica-text",
+ "angelica-view",
  "tempfile",
  "wasmtime",
 ]
@@ -90,6 +91,7 @@ dependencies = [
  "angelica-sqpack",
  "angelica-text",
  "angelica-update",
+ "angelica-view",
  "ed25519-dalek",
  "egui",
  "getrandom",
@@ -133,6 +135,7 @@ name = "angelica-sdk"
 version = "0.1.0"
 dependencies = [
  "angelica-text",
+ "angelica-view",
  "serde",
  "serde_json",
  "wit-bindgen",
@@ -166,6 +169,10 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror",
 ]
+
+[[package]]
+name = "angelica-view"
+version = "0.1.0"
 
 [[package]]
 name = "anyhow"
@@ -1069,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "harmonia"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "angelica-fake-game",
  "angelica-host",

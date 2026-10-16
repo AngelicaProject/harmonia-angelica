@@ -1,14 +1,12 @@
 //! Harmonia in a host with a scripted game: a pack goes from the import
 //! folder to translated rows at the next game start.
+use angelica_fake_game::ui::{Edited, Widget, WidgetRef};
 use angelica_fake_game::{TestHost, build_component_in, row_buffer, row_strings, store_row};
 use angelica_text::table::{Column, Variant};
 use runtime::{
     excel_text::SheetInfo,
     host::{Action, Event, Status},
-    sandbox::{
-        Limits,
-        bindings::angelica::plugin::ui::{Edited, Widget, WidgetRef},
-    },
+    sandbox::Limits,
 };
 use std::{path::Path, sync::OnceLock, time::Duration};
 
@@ -156,12 +154,30 @@ fn texts(test: &TestHost) -> Vec<String> {
     shown
 }
 
+/// The question the window asks: the dialog's id, then its title, texts,
+/// and facts as `name: value`.
+fn question(test: &TestHost) -> Vec<String> {
+    let windows = test.host.plugin("harmonia").unwrap().windows();
+    let Some(dialog) = windows.first().and_then(|window| window.dialog.as_ref()) else {
+        return Vec::new();
+    };
+    let mut shown = vec![dialog.id.clone(), dialog.title.clone()];
+    for widget in &dialog.widgets {
+        match widget {
+            Widget::Text(line) => shown.push(line.text.clone()),
+            Widget::Fact(fact) => shown.push(format!("{}: {}", fact.name, fact.value)),
+            _ => {}
+        }
+    }
+    shown
+}
+
 fn has_progress(test: &TestHost) -> bool {
     test.host.plugin("harmonia").unwrap().windows()[0]
         .widgets
         .iter()
         .any(|widget| match widget {
-            Widget::Progress(_) => true,
+            Widget::Meter(_) => true,
             // A row shows the work on its own translation or feed.
             Widget::Entry(entry) => entry.progress.is_some(),
             _ => false,
@@ -227,13 +243,14 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
 
     click(&test, "check-0");
     wait(&test);
-    assert!(
-        texts(&test)
-            .iter()
-            .any(|t| t.starts_with("Aeria tests — ru translation from en")),
-        "{:?}",
-        texts(&test)
+    let asked = question(&test);
+    assert_eq!(
+        asked.first().map(String::as_str),
+        Some("install"),
+        "{asked:?}"
     );
+    assert!(asked.iter().any(|t| t == "Team: Aeria tests"), "{asked:?}");
+    assert!(asked.iter().any(|t| t == "Language: ru ← en"), "{asked:?}");
     // Installing is choosing: the pack becomes the translation in use and is
     // prepared, with no separate Use.
     click(&test, "install");
@@ -253,7 +270,7 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
     let mut test = TestHost::in_folder(folder, Limits::default());
     start(&mut test);
     let shown = texts(&test);
-    assert!(shown.iter().any(|t| t == "Mark::On"), "{shown:?}");
+    assert!(shown.iter().any(|t| t == "On"), "{shown:?}");
 
     let excel = &test.services().excel;
     let columns = addon().columns;
@@ -307,6 +324,20 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
         "{:?}",
         texts(&test)
     );
+
+    // Removing asks first; Cancel keeps the translation.
+    click(&test, "remove-0");
+    test.frames(1);
+    assert_eq!(question(&test).first().map(String::as_str), Some("remove"));
+    click(&test, "remove-no");
+    test.frames(1);
+    assert!(question(&test).is_empty());
+    assert!(texts(&test).iter().any(|t| t == "Interop test pack"));
+    click(&test, "remove-0");
+    click(&test, "remove-yes");
+    test.frames(1);
+    assert!(question(&test).is_empty());
+    assert!(!texts(&test).iter().any(|t| t == "Interop test pack"));
 }
 
 /// Whether the Addon row 1 comes out translated.
@@ -432,11 +463,7 @@ fn a_real_pack_compiles_within_the_job_limits() {
     let started = std::time::Instant::now();
     start(&mut test);
     eprintln!("applied in {:?}: {:?}", started.elapsed(), texts(&test));
-    assert!(
-        texts(&test).iter().any(|t| t == "Mark::On"),
-        "{:?}",
-        texts(&test)
-    );
+    assert!(texts(&test).iter().any(|t| t == "On"), "{:?}", texts(&test));
 }
 
 /// The game's font files for the targets of the Aeria fonts pack: a table
@@ -540,13 +567,13 @@ fn a_pack_a_previous_game_downloaded_is_picked_up_at_the_next_start() {
     start(&mut test);
     wait(&test);
     // Its feed declared no key, so the player decides; the pack is not lost.
-    let shown = texts(&test);
-    assert!(
-        shown
-            .iter()
-            .any(|t| t.starts_with("Aeria tests — ru translation from en")),
-        "{shown:?}"
+    let asked = question(&test);
+    assert_eq!(
+        asked.first().map(String::as_str),
+        Some("install"),
+        "{asked:?}"
     );
+    assert!(asked.iter().any(|t| t == "Team: Aeria tests"), "{asked:?}");
     click(&test, "install");
     wait(&test);
     let shown = texts(&test);
