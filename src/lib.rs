@@ -38,7 +38,7 @@ use angelica_sdk::{
     Plugin,
     api::{file_replacements, game_files, jobs, runtime, storage},
     http, lens,
-    ui::{ActionKind, Entry, Event, Mark, Tone, Window},
+    ui::{ActionKind, Dialog, Entry, Event, Mark, Role, Tone, Window},
 };
 use library::{Settings, Stamp, Translation};
 use serde::{Deserialize, Serialize};
@@ -165,6 +165,9 @@ struct Harmonia {
     added: Option<String>,
     /// The feed whose publisher the player is asked to trust.
     asking: Option<String>,
+    /// The translation the player asked to remove, by its place in the
+    /// library, until they confirm.
+    removing: Option<usize>,
     /// Whether the field for a link is shown.
     adding: bool,
     since_imports: f64,
@@ -791,38 +794,34 @@ impl Harmonia {
     }
 
     /// The question whether to trust the publisher of a link just added.
-    fn trust_lines(&self, window: Window, url: &str) -> Window {
-        let Some((_, view)) = self.feeds.iter().find(|(feed, _)| feed == url) else {
-            return window;
-        };
+    fn trust_dialog(&self, url: &str) -> Option<Dialog> {
+        let (_, view) = self.feeds.iter().find(|(feed, _)| feed == url)?;
         let FeedStatus::Available(release) = &view.status else {
-            return window;
+            return None;
         };
         let title = view.title.as_deref().unwrap_or(url);
-        let language = language_name(&release.language, self.russian);
-        let mut window = window.heading(title).text(if self.russian {
-            format!(
-                "Перевод: {language}, версия {}, {}.",
-                release.version,
-                megabytes(release.size)
-            )
-        } else {
-            format!(
-                "Translation: {language}, version {}, {}.",
-                release.version,
-                megabytes(release.size)
-            )
-        });
-        window = match &view.key {
-            Some(key) => window.text(if self.russian {
-                format!("Издатель подписывает переводы ключом {}.", short(key))
-            } else {
-                format!(
-                    "The publisher signs translations with the key {}.",
-                    short(key)
+        let dialog = Dialog::new(
+            "trust",
+            self.tr("Trust this publisher?", "Доверять издателю?"),
+        )
+        .styled(title, Role::Title, Tone::Normal)
+        .fact(
+            self.tr("Language", "Язык"),
+            language_name(&release.language, self.russian),
+        )
+        .fact(self.tr("Version", "Версия"), &release.version)
+        .fact(self.tr("Size", "Размер"), megabytes(release.size));
+        let dialog = match &view.key {
+            Some(key) => dialog
+                .fact(
+                    self.tr("Publisher", "Издатель"),
+                    format!("{} {}", self.tr("key", "ключ"), short(key)),
                 )
-            }),
-            None => window.toned(
+                .text(self.tr(
+                    "The publisher signs translations with this key.",
+                    "Издатель подписывает переводы этим ключом.",
+                )),
+            None => dialog.toned(
                 self.tr(
                     "The feed names no publisher key: whoever made the pack cannot be checked.",
                     "Лента не называет ключ издателя: кто сделал пак, проверить нельзя.",
@@ -830,22 +829,20 @@ impl Harmonia {
                 Tone::Warning,
             ),
         };
-        window
-            .row(|row| {
-                row.action(
-                    "trust",
-                    self.tr("Trust and download", "Доверять и скачать"),
-                    ActionKind::Main,
-                    true,
-                )
-                .action(
-                    "distrust",
-                    self.tr("Cancel", "Отмена"),
-                    ActionKind::Quiet,
-                    true,
-                )
-            })
-            .separator()
+        Some(dialog.row(|row| {
+            row.action(
+                "trust",
+                self.tr("Trust and download", "Доверять и скачать"),
+                ActionKind::Main,
+                true,
+            )
+            .action(
+                "distrust",
+                self.tr("Cancel", "Отмена"),
+                ActionKind::Quiet,
+                true,
+            )
+        }))
     }
 
     /// Installs the pack that waited for the player's decision.
@@ -918,7 +915,11 @@ impl Harmonia {
             .strip_prefix("remove-")
             .and_then(|i| i.parse::<usize>().ok())
         {
-            if index < self.library.len() {
+            self.removing = Some(index);
+        } else if id == "remove-yes" {
+            if let Some(index) = self.removing.take()
+                && index < self.library.len()
+            {
                 let removed = self.library.remove(index);
                 if self.settings.active.as_deref() == Some(removed.hash.as_str()) {
                     self.settings.active = None;
@@ -948,6 +949,7 @@ impl Harmonia {
                         Tone::Normal,
                     );
                 }
+                "remove-no" => self.removing = None,
                 "refresh" => self.imports = library::imports(),
                 "install" => self.install_inspected(),
                 "cancel" => self.cancel_inspection(),
@@ -1246,42 +1248,52 @@ impl Harmonia {
         entry
     }
 
-    /// The pack that waits for the player's decision.
-    fn inspection_lines(&self, window: Window, inspection: &Inspection) -> Window {
+    /// The question whether to install the pack that was checked.
+    fn inspection_dialog(&self, inspection: &Inspection) -> Dialog {
         let translation = &inspection.translation;
-        let mut window = window
-            .heading(format!("{} {}", translation.title, translation.version))
-            .text(if self.russian {
+        let dialog = Dialog::new(
+            "install",
+            self.tr("Install this translation?", "Установить перевод?"),
+        )
+        .styled(
+            format!("{} {}", translation.title, translation.version),
+            Role::Title,
+            Tone::Normal,
+        )
+        .fact(self.tr("Team", "Команда"), &translation.team)
+        .fact(
+            self.tr("Language", "Язык"),
+            format!("{} ← {}", translation.language, translation.game_language),
+        )
+        .fact(
+            self.tr("Translated", "Переведено"),
+            if self.russian {
                 format!(
-                    "{} — перевод на {} с {}, ячеек: {}, листов: {}, сделан для игры {}.",
-                    translation.team,
-                    translation.language,
-                    translation.game_language,
-                    translation.cells,
-                    translation.sheets,
-                    translation.game_version
+                    "ячеек: {}, листов: {}",
+                    translation.cells, translation.sheets
                 )
             } else {
                 format!(
-                    "{} — {} translation from {}, {} cells in {} sheets, made for game {}.",
-                    translation.team,
-                    translation.language,
-                    translation.game_language,
-                    translation.cells,
-                    translation.sheets,
-                    translation.game_version
+                    "{} cells in {} sheets",
+                    translation.cells, translation.sheets
                 )
-            });
-        window = match &translation.key {
-            Some(key) if self.russian => window.text(format!(
-                "Подписан ключом {}. Устанавливайте, только если доверяете этому издателю.",
-                short(key)
-            )),
-            Some(key) => window.text(format!(
-                "Signed by key {}. Install only if you trust this publisher.",
-                short(key)
-            )),
-            None => window.toned(
+            },
+        )
+        .fact(
+            self.tr("Made for the game", "Сделан для игры"),
+            &translation.game_version,
+        );
+        let dialog = match &translation.key {
+            Some(key) => dialog
+                .fact(
+                    self.tr("Publisher", "Издатель"),
+                    format!("{} {}", self.tr("key", "ключ"), short(key)),
+                )
+                .text(self.tr(
+                    "Install only if you trust this publisher.",
+                    "Устанавливайте, только если доверяете этому издателю.",
+                )),
+            None => dialog.toned(
                 self.tr(
                     "This pack is not signed: anyone could have made or changed it.",
                     "Этот пак не подписан: его мог сделать или изменить кто угодно.",
@@ -1289,22 +1301,46 @@ impl Harmonia {
                 Tone::Warning,
             ),
         };
-        window
-            .row(|row| {
-                row.action(
-                    "install",
-                    self.tr("Install", "Установить"),
-                    ActionKind::Main,
-                    self.job.is_none(),
+        dialog.row(|row| {
+            row.action(
+                "install",
+                self.tr("Install", "Установить"),
+                ActionKind::Main,
+                self.job.is_none(),
+            )
+            .action(
+                "cancel",
+                self.tr("Not now", "Не сейчас"),
+                ActionKind::Quiet,
+                true,
+            )
+        })
+    }
+
+    /// The question whether to remove an installed translation.
+    fn removal_dialog(&self, index: usize) -> Option<Dialog> {
+        let translation = self.library.get(index)?;
+        Some(
+            Dialog::new("remove", self.tr("Remove this translation?", "Удалить перевод?"))
+                .styled(
+                    format!("{} {}", translation.title, translation.version),
+                    Role::Title,
+                    Tone::Normal,
                 )
-                .action(
-                    "cancel",
-                    self.tr("Not now", "Не сейчас"),
-                    ActionKind::Quiet,
-                    true,
-                )
-            })
-            .separator()
+                .text(self.tr(
+                    "Its files leave Harmonia; download or add the pack again to get it back.",
+                    "Его файлы удаляются из Harmonia; чтобы вернуть перевод, скачайте или добавьте пак снова.",
+                ))
+                .row(|row| {
+                    row.action(
+                        "remove-yes",
+                        self.tr("Remove", "Удалить"),
+                        ActionKind::Danger,
+                        self.job.is_none(),
+                    )
+                    .action("remove-no", self.tr("Cancel", "Отмена"), ActionKind::Quiet, true)
+                }),
+        )
     }
 
     /// Every translation by its language, then the game without one, then
@@ -1480,6 +1516,7 @@ impl Plugin for Harmonia {
             chosen_pack: None,
             added: None,
             asking: None,
+            removing: None,
             adding: false,
             since_imports: 0.0,
             russian: runtime::language() == "ru",
@@ -1588,12 +1625,6 @@ impl Plugin for Harmonia {
         if let Some(restart) = self.restart_line() {
             window = window.toned(restart, Tone::Warning);
         }
-        if let Some(url) = &self.asking {
-            window = self.trust_lines(window, url);
-        }
-        if let Some(inspection) = &self.inspection {
-            window = self.inspection_lines(window, inspection);
-        }
         if !self.started_with_game {
             window = window.toned(
                 self.tr(
@@ -1617,6 +1648,21 @@ impl Plugin for Harmonia {
             window = window.toned(&self.message.0, self.message.1);
         }
         window = self.link(window.separator());
+        // One question at a time over the window: the publisher of a link
+        // just added, then a checked pack, then a removal.
+        let dialog = self
+            .asking
+            .as_deref()
+            .and_then(|url| self.trust_dialog(url))
+            .or_else(|| {
+                self.inspection
+                    .as_ref()
+                    .map(|inspection| self.inspection_dialog(inspection))
+            })
+            .or_else(|| self.removing.and_then(|index| self.removal_dialog(index)));
+        if let Some(dialog) = dialog {
+            window = window.dialog(dialog);
+        }
         vec![window]
     }
 
@@ -1626,6 +1672,10 @@ impl Plugin for Harmonia {
                 self.open = true;
                 self.imports = library::imports();
             }
+            // Closing a question is the same as not answering it.
+            Event::Closed(place) if place == "trust" => self.click("distrust"),
+            Event::Closed(place) if place == "install" => self.cancel_inspection(),
+            Event::Closed(place) if place == "remove" => self.removing = None,
             Event::Closed(_) => self.open = false,
             Event::Clicked(target) => self.click(&target.id),
             Event::Edited(edited) if edited.id == "feed" => self.feed_input = edited.value,
