@@ -3,7 +3,7 @@ manifest = 1
 [plugin]
 id = "harmonia"
 name = "Harmonia"
-version = "0.3.0"
+version = "0.4.0"
 api = "1.0"
 description = "Shows the game in another language with community translation packs."
 authors = ["pokeda"]
