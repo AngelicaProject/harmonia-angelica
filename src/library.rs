@@ -6,6 +6,8 @@
 //! packs/<hash>.hpk        installed packs, named by their pack hash
 //! tables/<hash>.table     the text table of a pack, for the host
 //! tables/<hash>.json      what that table was built from (Stamp)
+//! tables/<hash>.sheets.json  what the pack holds, by sheet (catalog::Catalog)
+//! names/index.txt         the name dictionary (names)
 //! translations.json       installed translations (Translation)
 //! settings.json           the player's choices (Settings)
 //! session.json            the number of this game start (Session)
@@ -39,6 +41,9 @@ pub struct Translation {
     /// The feed the translation updates from.
     #[serde(default)]
     pub feed: Option<String>,
+    /// What the publisher says is new in this version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changelog: Option<String>,
 }
 
 impl Translation {
@@ -70,22 +75,68 @@ fn stamp_path(hash: &str) -> String {
 
 /// The player's choices. Like every translation choice, they apply at the
 /// next game start.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     /// The pack hash of the translation to apply.
     pub active: Option<String>,
-    /// Sheets (`Item`) and folders (`quest/*`) kept in the game's language.
+    /// Sheets an earlier Harmonia kept whole in the game's language; moved
+    /// into a group of `coverage` when read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kept_sheets: Vec<String>,
+    /// What stays in the game's language.
+    #[serde(default)]
+    pub coverage: crate::coverage::Coverage,
     /// The feed links Harmonia checks for new versions.
     #[serde(default)]
     pub feeds: Vec<String>,
+    /// A newer release of an installed translation installs by itself.
+    #[serde(default = "yes")]
+    pub auto_install: bool,
+    /// Minutes between checks of the feeds.
+    #[serde(default = "hour")]
+    pub check_minutes: u32,
+    /// Testing releases count as well as stable ones.
+    #[serde(default)]
+    pub testing: bool,
+    /// Game languages (`ja`, `en`, `de`, `fr`) the dictionary shows besides
+    /// the game's own.
+    #[serde(default)]
+    pub dictionary_languages: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn hour() -> u32 {
+    60
+}
+
+/// The choices of check intervals, in minutes.
+pub const CHECK_CHOICES: [u32; 6] = [15, 30, 60, 180, 360, 1440];
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            active: None,
+            kept_sheets: Vec::new(),
+            coverage: crate::coverage::Coverage::default(),
+            feeds: Vec::new(),
+            auto_install: true,
+            check_minutes: 60,
+            testing: false,
+            dictionary_languages: Vec::new(),
+        }
+    }
 }
 
 /// What a table was built from: a table is current while these match.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stamp {
     pub hash: String,
-    pub kept_sheets: Vec<String>,
+    /// The coverage the table was built with (`Coverage::fingerprint`).
+    #[serde(default)]
+    pub coverage: String,
     pub summary: crate::compile::Summary,
     /// The game build the font files were made from.
     pub game_version: String,
@@ -124,7 +175,17 @@ pub fn save_library(library: &[Translation]) -> Result<(), String> {
 /// # Errors
 /// When the file exists and cannot be read.
 pub fn load_settings() -> Result<Settings, String> {
-    Ok(read_json(SETTINGS)?.unwrap_or_default())
+    let mut settings: Settings = read_json(SETTINGS)?.unwrap_or_default();
+    if !settings.kept_sheets.is_empty() {
+        let kept = std::mem::take(&mut settings.kept_sheets);
+        settings
+            .coverage
+            .adopt(&kept, &crate::words("Kept before", "Оставлено раньше"));
+    }
+    if !CHECK_CHOICES.contains(&settings.check_minutes) {
+        settings.check_minutes = 60;
+    }
+    Ok(settings)
 }
 
 /// # Errors
@@ -192,7 +253,12 @@ pub fn remove_files(hash: &str) {
             let _ = storage::remove(path);
         }
     }
-    for path in [pack_path(hash), table_path(hash), stamp_path(hash)] {
+    for path in [
+        pack_path(hash),
+        table_path(hash),
+        stamp_path(hash),
+        crate::catalog::path(hash),
+    ] {
         let _ = storage::remove(&path);
     }
 }
@@ -283,6 +349,18 @@ pub fn downloaded() -> Vec<Download> {
 /// # Errors
 /// When the file is missing, larger than `limit`, or unreadable.
 pub fn read_file(path: &str, limit: u64) -> Result<Vec<u8>, String> {
+    read_ranges(path, limit, true)
+}
+
+/// Reads a whole file in ranges without reporting progress.
+///
+/// # Errors
+/// When the file is missing, larger than `limit`, or unreadable.
+pub fn read_quietly(path: &str, limit: u64) -> Result<Vec<u8>, String> {
+    read_ranges(path, limit, false)
+}
+
+fn read_ranges(path: &str, limit: u64, report: bool) -> Result<Vec<u8>, String> {
     const RANGE: u32 = 8 * 1024 * 1024;
     let size = storage::size(path).map_err(|e| format!("{path}: {}", e.message))?;
     if size > limit {
@@ -295,7 +373,7 @@ pub fn read_file(path: &str, limit: u64) -> Result<Vec<u8>, String> {
         let part = storage::read_range(path, bytes.len() as u64, length)
             .map_err(|e| format!("{path}: {}", e.message))?;
         bytes.extend_from_slice(&part);
-        if size > 0 {
+        if report && size > 0 {
             #[allow(clippy::cast_precision_loss)]
             let fraction = bytes.len() as f32 / size as f32 * 0.3;
             let _ = angelica_sdk::api::jobs::report(

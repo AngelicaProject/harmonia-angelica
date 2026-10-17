@@ -33,6 +33,9 @@ pub struct Release {
     /// SHA-256 of the downloaded file, 64 hex digits.
     pub sha256: String,
     pub unpacked_size: u64,
+    /// What the publisher says is new.
+    #[serde(default)]
+    pub changelog: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +145,12 @@ fn release(value: &Value) -> Result<Release, String> {
         size: integer(download, "size")?,
         sha256,
         unpacked_size: integer(download, "unpackedSize")?,
+        changelog: value
+            .get("changelog")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned),
     })
 }
 
@@ -179,13 +188,13 @@ pub fn parse(bytes: &[u8]) -> Result<Feed, String> {
 }
 
 impl Feed {
-    /// The newest stable release. Versions have a fixed width, so they sort
-    /// as text.
+    /// The newest stable release, or testing one when `testing`. Versions
+    /// have a fixed width, so they sort as text.
     #[must_use]
-    pub fn newest(&self) -> Option<&Release> {
+    pub fn newest(&self, testing: bool) -> Option<&Release> {
         self.releases
             .iter()
-            .filter(|release| release.channel == "stable")
+            .filter(|release| release.channel == "stable" || testing)
             .max_by(|a, b| a.version.cmp(&b.version))
     }
 }
@@ -293,7 +302,7 @@ mod tests {
         let feed = parse(FEED.as_bytes()).unwrap();
         assert_eq!(feed.title.as_deref(), Some("Sample"));
         assert_eq!(feed.releases.len(), 3);
-        let newest = feed.newest().unwrap();
+        let newest = feed.newest(false).unwrap();
         assert_eq!(newest.version, "2026.10.07.0001");
         assert!(newest.brotli);
         assert!(newest.supported_by("0.2.0"));
