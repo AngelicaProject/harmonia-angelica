@@ -29,4 +29,4 @@ Translation packs are made with [Aeria](https://github.com/AngelicaProject/Aeria
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE.md).
+Copyright (C) 2026 pokeda. Licensed under [AGPL-3.0-or-later](LICENSE.md), with the author attribution term in [NOTICE](NOTICE).
