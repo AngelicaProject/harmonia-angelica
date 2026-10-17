@@ -7,10 +7,10 @@ Harmonia is also a Dalamud plugin, [HarmoniaEngine](https://github.com/AngelicaP
 ## Using it
 
 1. Install Harmonia from the Angelica menu.
-2. Open Harmonia, paste the link the translation's author gave you, and press **Add**, or put the translation file (`.hpk`) into Harmonia's `import` folder (the window's menu, **Open folder**).
+2. Open Harmonia and press **Install** on the suggested translation, or paste the link the translation's author gave you and press **Add**, or put the translation file (`.hpk`) into Harmonia's `import` folder (the window's menu, **Open folder**).
 3. Restart the game.
 
-Translations added from a link update themselves. Changes take effect at the next game start. If something goes wrong, use **Copy report** on Harmonia in the Angelica menu and send it to the translation's author.
+Translations added from a link update themselves, unless you turn that off in **Settings**. **Coverage** chooses what stays in the game's language: names and descriptions of each group of sheets apart, down to a single column. **Dictionary**, and `/hfind` in chat, find a name in the game's language and in the translation; a click on one shows it in the other languages, with buttons to copy it, try it on, or open its page on a game wiki. Changes take effect at the next game start. If something goes wrong, use **Copy report for the author** on Harmonia in the Angelica menu and send it to the translation's author.
 
 ## For developers
 

@@ -2,6 +2,7 @@
 //! cells to the rows the game builds, with the same checks Harmonia makes
 //! (sheet layout, variant, client language, and the source guard of every
 //! cell).
+use crate::coverage::SheetKeep;
 use crate::pack::{GUARD_DOMAIN, Pack};
 use angelica_sdk::text::table::{Column, Variant, Writer};
 
@@ -51,29 +52,27 @@ pub fn cyrillic_letters() -> Vec<(char, char)> {
 pub struct Summary {
     pub sheets: usize,
     pub cells: usize,
-    /// Sheets the player keeps in the game's language.
+    /// Sheets left whole in the game's language.
     pub kept_sheets: usize,
+    /// Cells left in the game's language, whole sheets included.
+    #[serde(default)]
+    pub kept_cells: usize,
     /// Cells whose text is a reserved token (`_rsv_…`): the game resolves
     /// and hashes those itself, so they are never written.
     pub reserved: usize,
 }
 
-/// Whether the player keeps `sheet` in the game's language: `kept` lists
-/// sheet names (`Item`) and folders (`quest/*`).
-#[must_use]
-pub fn is_kept(sheet: &str, kept: &[String]) -> bool {
-    kept.iter().any(|entry| match entry.strip_suffix('*') {
-        Some(folder) => sheet.starts_with(folder),
-        None => entry == sheet,
-    })
-}
-
-/// The table for `pack`, without the sheets the player keeps.
+/// The table for `pack`, without what `keep` leaves in the game's language:
+/// it is asked once per sheet with the sheet's name and its columns'
+/// positions.
 ///
 /// # Errors
-/// When the pack's game language is not one the game has, or the pack does
-/// not fit the table format.
-pub fn compile(pack: &Pack<'_>, kept: &[String]) -> Result<(Vec<u8>, Summary), String> {
+/// When the pack's game language is not one the game has, the pack does
+/// not fit the table format, or `keep` fails.
+pub fn compile(
+    pack: &Pack<'_>,
+    mut keep: impl FnMut(&str, &[u16]) -> Result<SheetKeep, String>,
+) -> Result<(Vec<u8>, Summary), String> {
     let language = game_language(&pack.manifest.game.language)
         .ok_or_else(|| format!("the game has no language {}", pack.manifest.game.language))?;
     let mut writer = Writer::new(language, GUARD_DOMAIN).map_err(|e| e.to_string())?;
@@ -81,13 +80,20 @@ pub fn compile(pack: &Pack<'_>, kept: &[String]) -> Result<(Vec<u8>, Summary), S
         sheets: 0,
         cells: 0,
         kept_sheets: 0,
+        kept_cells: 0,
         reserved: 0,
     };
     for sheet in pack.sheets() {
-        if is_kept(sheet.name, kept) {
-            summary.kept_sheets += 1;
-            continue;
-        }
+        let positions: Vec<u16> = sheet.layout.iter().map(|column| column.index).collect();
+        let kept = match keep(sheet.name, &positions)? {
+            SheetKeep::Original => {
+                summary.kept_sheets += 1;
+                summary.kept_cells += sheet.cells().count();
+                continue;
+            }
+            SheetKeep::Translate => Vec::new(),
+            SheetKeep::Columns(columns) => columns,
+        };
         let columns: Vec<_> = sheet
             .layout
             .iter()
@@ -105,11 +111,15 @@ pub fn compile(pack: &Pack<'_>, kept: &[String]) -> Result<(Vec<u8>, Summary), S
             .sheet(sheet.name, variant, &columns)
             .map_err(|e| e.to_string())?;
         for cell in sheet.cells() {
+            let column = sheet.layout[usize::from(cell.ordinal)].index;
+            if kept.contains(&column) {
+                summary.kept_cells += 1;
+                continue;
+            }
             if cell.text.starts_with(b"_rsv_") {
                 summary.reserved += 1;
                 continue;
             }
-            let column = sheet.layout[usize::from(cell.ordinal)].index;
             writer
                 .cell(
                     sheet.name,
@@ -137,7 +147,7 @@ mod tests {
     #[test]
     fn every_pack_cell_becomes_a_table_cell() {
         let pack = Pack::parse(INTEROP).unwrap();
-        let (bytes, summary) = compile(&pack, &[]).unwrap();
+        let (bytes, summary) = compile(&pack, |_, _| Ok(SheetKeep::Translate)).unwrap();
         let table = Table::parse(&bytes).unwrap();
         assert_eq!(table.domain(), GUARD_DOMAIN);
         assert_eq!(
@@ -159,14 +169,36 @@ mod tests {
     }
 
     #[test]
-    fn kept_sheets_are_left_out() {
+    fn kept_sheets_and_columns_are_left_out() {
         let pack = Pack::parse(INTEROP).unwrap();
         let first = pack.sheets().next().unwrap().name.to_owned();
-        let (bytes, summary) = compile(&pack, std::slice::from_ref(&first)).unwrap();
+        let (bytes, summary) = compile(&pack, |sheet, _| {
+            Ok(if sheet == first {
+                SheetKeep::Original
+            } else {
+                SheetKeep::Translate
+            })
+        })
+        .unwrap();
         assert_eq!(summary.kept_sheets, 1);
         assert!(Table::parse(&bytes).unwrap().sheet(&first).is_none());
-        assert!(is_kept("quest/001/Text", &["quest/*".into()]));
-        assert!(!is_kept("Quest", &["quest/*".into()]));
+
+        let (bytes, summary) =
+            compile(&pack, |_, columns| Ok(SheetKeep::Columns(vec![columns[0]]))).unwrap();
+        let table = Table::parse(&bytes).unwrap();
+        assert!(summary.kept_cells > 0);
+        assert_eq!(summary.cells + summary.kept_cells, pack.cell_count());
+        for sheet in pack.sheets() {
+            let first = sheet.layout[0].index;
+            // A sheet left with no cells is not in the table.
+            let Some(listed) = table.sheet(sheet.name) else {
+                continue;
+            };
+            for cell in sheet.cells() {
+                let row = listed.row(cell.row, cell.subrow);
+                assert!(row.iter().all(|c| c.column != first));
+            }
+        }
     }
 
     #[test]
