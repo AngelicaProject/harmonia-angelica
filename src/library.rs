@@ -134,6 +134,9 @@ impl Default for Settings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stamp {
     pub hash: String,
+    /// `compile::TABLE_FORMAT` of the table; tables before it have 0.
+    #[serde(default)]
+    pub table_format: u32,
     /// The coverage the table was built with (`Coverage::fingerprint`).
     #[serde(default)]
     pub coverage: String,

@@ -47,6 +47,23 @@ pub fn cyrillic_letters() -> Vec<(char, char)> {
         .collect()
 }
 
+/// What a table leaves out of a pack whatever the coverage; a table of
+/// another format is built again.
+pub const TABLE_FORMAT: u32 = 1;
+
+/// Text the game sends to the server: the default name an event script reads
+/// with `GetAddonText` when the player buys an apartment or private chambers
+/// or registers a company airship or submersible. The server refuses a
+/// translated name ("Failed to complete housing action."), so these rows stay
+/// in the game's language (`HarmoniaEngine`'s `Runtime/ServerNames.cs`).
+const SERVER_NAME_SHEET: &str = "Addon";
+const SERVER_NAME_ROWS: [u32; 4] = [6487, 6489, 6710, 6888];
+
+#[must_use]
+pub fn is_server_name(sheet: &str, row: u32) -> bool {
+    sheet == SERVER_NAME_SHEET && SERVER_NAME_ROWS.contains(&row)
+}
+
 /// What the table holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Summary {
@@ -62,9 +79,9 @@ pub struct Summary {
     pub reserved: usize,
 }
 
-/// The table for `pack`, without what `keep` leaves in the game's language:
-/// it is asked once per sheet with the sheet's name and its columns'
-/// positions.
+/// The table for `pack`, without what `keep` leaves in the game's language
+/// and the names the game sends to the server: `keep` is asked once per sheet
+/// with the sheet's name and its columns' positions.
 ///
 /// # Errors
 /// When the pack's game language is not one the game has, the pack does
@@ -112,7 +129,7 @@ pub fn compile(
             .map_err(|e| e.to_string())?;
         for cell in sheet.cells() {
             let column = sheet.layout[usize::from(cell.ordinal)].index;
-            if kept.contains(&column) {
+            if kept.contains(&column) || is_server_name(sheet.name, cell.row) {
                 summary.kept_cells += 1;
                 continue;
             }
@@ -199,6 +216,13 @@ mod tests {
                 assert!(row.iter().all(|c| c.column != first));
             }
         }
+    }
+
+    #[test]
+    fn server_names_stay_untranslated() {
+        assert!(is_server_name("Addon", 6710) && is_server_name("Addon", 6487));
+        assert!(is_server_name("Addon", 6489) && is_server_name("Addon", 6888));
+        assert!(!is_server_name("Addon", 6711) && !is_server_name("Item", 6710));
     }
 
     #[test]

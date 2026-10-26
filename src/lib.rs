@@ -404,12 +404,13 @@ impl Harmonia {
             .unwrap_or(angelica_sdk::excel::ENGLISH)
     }
 
-    /// Whether the table of `hash` was built with the current coverage and
-    /// its fonts from the running game's files.
+    /// Whether the table of `hash` was built by this table format with the
+    /// current coverage and its fonts from the running game's files.
     fn table_is_current(&self, hash: &str) -> bool {
         matches!(
             library::load_stamp(hash),
-            Ok(Some(stamp)) if stamp.coverage == self.settings.coverage.fingerprint()
+            Ok(Some(stamp)) if stamp.table_format == compile::TABLE_FORMAT
+                && stamp.coverage == self.settings.coverage.fingerprint()
                 && stamp.game_version == runtime::game_version()
         )
     }
@@ -1801,6 +1802,7 @@ fn compile_job(input: CompileInput) -> Result<Stamp, String> {
     storage::write(&library::table_path(&input.hash), &table).map_err(|e| e.message)?;
     let stamp = Stamp {
         hash: input.hash,
+        table_format: compile::TABLE_FORMAT,
         coverage: input.coverage.fingerprint(),
         summary,
         game_version: runtime::game_version(),
