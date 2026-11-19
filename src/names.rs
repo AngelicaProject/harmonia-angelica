@@ -6,7 +6,7 @@
 //! The index is built in a job from the game's sheets and the applied
 //! translation and kept in storage as lines; a search is a job too, so the
 //! game's frame never holds a hundred thousand names.
-use crate::coverage::{self, Coverage, SheetKeep};
+use crate::coverage::{Coverage, SheetKeep};
 use serde::{Deserialize, Serialize};
 
 pub const INDEX: &str = "names/index.txt";
@@ -129,9 +129,6 @@ pub struct Name {
     /// none.
     #[serde(default)]
     pub english: String,
-    /// An item that can be worn or held, and so tried on.
-    #[serde(default)]
-    pub wearable: bool,
 }
 
 impl Name {
@@ -307,7 +304,7 @@ impl Item {
             .map(|o| format!("{}{PAIR}{}", o.language, clean(&o.text)))
             .collect();
         format!(
-            "{}{FIELD}{}{FIELD}{}{FIELD}{}{FIELD}{}{FIELD}{}{FIELD}{}{FIELD}{}",
+            "{}{FIELD}{}{FIELD}{}{FIELD}{}{FIELD}{}{FIELD}{}{FIELD}{}",
             self.name.category.number(),
             self.name.row,
             self.name.icon,
@@ -315,7 +312,6 @@ impl Item {
             originals.join(&PART.to_string()),
             self.forms.join(&PART.to_string()),
             clean(&self.name.english),
-            u8::from(self.name.wearable),
         )
     }
 
@@ -338,7 +334,6 @@ impl Item {
             .collect();
         let forms = fields.next()?.split(PART).map(str::to_owned).collect();
         let english = fields.next().unwrap_or_default().to_owned();
-        let wearable = fields.next() == Some("1");
         Some(Self {
             name: Name {
                 category,
@@ -347,7 +342,6 @@ impl Item {
                 shown,
                 originals,
                 english,
-                wearable,
             },
             forms,
         })
@@ -646,7 +640,7 @@ pub fn build(input: &Build) -> Result<(Vec<String>, Built), String> {
         Some(bytes) => Some(crate::pack::Pack::parse(bytes).map_err(|e| e.0)?),
         None => None,
     };
-    let groups = input.coverage.groups();
+    let groups = input.coverage.policy_groups();
     let mut built = Built::default();
     let mut names = Vec::new();
     for (step, category) in Category::ALL.into_iter().enumerate() {
@@ -677,11 +671,7 @@ pub fn build(input: &Build) -> Result<(Vec<String>, Built), String> {
             ),
             _ => (None, None),
         };
-        let wear = category == Category::Item && has("equip_slot");
-        let columns: Vec<&str> = std::iter::once("name")
-            .chain(link)
-            .chain(wear.then_some("equip_slot"))
-            .collect();
+        let columns: Vec<&str> = std::iter::once("name").chain(link).collect();
         let mut translated: std::collections::HashMap<u32, (u64, &[u8])> =
             std::collections::HashMap::new();
         if let Some(pack) = &pack
@@ -695,7 +685,9 @@ pub fn build(input: &Build) -> Result<(Vec<String>, Built), String> {
                     .map(|f| (f.name.clone(), f.index))
                     .collect())
             };
-            let keep = coverage::sheet_keep(&groups, sheet, &positions, given)?;
+            let keep = input
+                .coverage
+                .effective_sheet(&groups, sheet, &positions, given)?;
             if translated_names(&keep, name_field.index) {
                 for cell in own.cells() {
                     if cell.subrow == 0
@@ -783,12 +775,6 @@ pub fn build(input: &Build) -> Result<(Vec<String>, Built), String> {
                     .or_else(|| english.get(&row.key.row).map(|t| t.trim().to_owned()))
                     .unwrap_or_default()
             };
-            let wearable = wear
-                && row
-                    .values
-                    .last()
-                    .and_then(excel::Value::unsigned)
-                    .is_some_and(|slot| slot != 0);
             names.push(Name {
                 category,
                 row: row.key.row,
@@ -808,7 +794,6 @@ pub fn build(input: &Build) -> Result<(Vec<String>, Built), String> {
                 shown: shown.trim().to_owned(),
                 originals,
                 english,
-                wearable,
             });
         }
     }
@@ -832,7 +817,6 @@ mod tests {
                 text: original.into(),
             }],
             english: original.into(),
-            wearable: false,
         }
     }
 

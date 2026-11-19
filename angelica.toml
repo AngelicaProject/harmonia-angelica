@@ -3,8 +3,8 @@ manifest = 1
 [plugin]
 id = "harmonia"
 name = "Harmonia"
-version = "0.5.1"
-api = "1.0"
+version = "0.6.0"
+api = "1.3"
 description = "Shows the game in another language with community translation packs."
 authors = ["pokeda"]
 # A job holds a whole pack (up to 1 GiB by the format, about 125 MB in
@@ -14,7 +14,7 @@ memory_bytes = 1073741824
 [permissions]
 "files.replace" = true
 "http.get" = true
-# /hfind in chat, its answer in the chat log, and copying a name.
+# /harmonia and /hfind in chat, search results in the chat log, and copying a name.
 "chat.commands" = true
 "chat.print" = true
 "clipboard.write" = true
@@ -27,10 +27,8 @@ memory_bytes = 1073741824
 hosts = ["*.github.io", "github.com", "*.githubusercontent.com"]
 
 [links]
-hosts = ["ffxiv.consolegameswiki.com", "www.garlandtools.org"]
+hosts = ["ffxiv.consolegameswiki.com", "www.garlandtools.org", "xiviewer.app"]
 
-# The game's sheet text, from the translation's table, and letter case;
-# trying on an item from the dictionary.
+# The game's sheet text, from the translation's table, and letter case.
 [lens]
-act = ["fitting"]
 change = ["text"]

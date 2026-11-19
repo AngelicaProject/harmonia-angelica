@@ -1,17 +1,6 @@
-//! What a translation leaves in the game's language: groups of sheets,
-//! each with one choice for its names and one for its descriptions, and
-//! any column of a sheet set apart from its group.
-//!
-//! A group holds entries: a sheet (`Item`), one column of a sheet
-//! (`Item:description`), or a folder of sheets (`quest/*`). Harmonia ships
-//! ten groups, the same sets as `HarmoniaEngine`'s `Packs/SheetGroups.cs`;
-//! the player renames them, changes their sheets, removes them, restores
-//! them, and makes groups of their own. The settings keep only what the
-//! player changed, so a built-in group Harmonia changes later reaches the
-//! player unless they changed it themselves.
-//!
-//! Whether a column is a name or a description comes from the column
-//! names the game map gives (`excel.sheet`): see [`kind`].
+//! Sheet and column rules for text that stays in the game's language.
+//! Groups are filters over those rules. Old group-based choices are preserved
+//! when settings are first edited in the new Coverage tab.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -32,6 +21,73 @@ pub enum Keep {
 pub enum Kind {
     Name,
     Description,
+}
+
+fn part_key(sheet: &str, part: Kind) -> String {
+    let label = match part {
+        Kind::Name => "names",
+        Kind::Description => "descriptions",
+    };
+    format!("{sheet}#{label}")
+}
+
+#[must_use]
+pub fn entry_matches(entry: &str, sheet: &str) -> bool {
+    let entry = entry.split_once(':').map_or(entry, |(sheet, _)| sheet);
+    entry
+        .strip_suffix('*')
+        .map_or(entry == sheet, |folder| sheet.starts_with(folder))
+}
+
+/// Column indices used by the Dalamud Coverage view. Other columns remain
+/// part of the whole sheet and are available through its checkbox.
+#[must_use]
+pub fn part_kind(sheet: &str, column: u16) -> Option<Kind> {
+    use Kind::{Description, Name};
+    Some(match (sheet, column) {
+        ("Item", 0 | 2 | 9)
+        | ("ContentRoulette", 0 | 1)
+        | (
+            "Status" | "CraftAction" | "GeneralAction" | "PetAction" | "BuddyAction"
+            | "CompanyAction",
+            0,
+        )
+        | ("CompanionTransient", 3)
+        | ("Glasses", 4 | 6 | 13)
+        | ("Achievement", 1)
+        | (
+            "EventItem"
+            | "ContentFinderCondition"
+            | "Action"
+            | "Trait"
+            | "Mount"
+            | "Companion"
+            | "Ornament"
+            | "GlassesStyle"
+            | "Title",
+            _,
+        ) => Name,
+        ("Item", 8)
+        | ("ContentRoulette", 3 | 4)
+        | (
+            "Status" | "CraftAction" | "GeneralAction" | "PetAction" | "BuddyAction"
+            | "CompanyAction",
+            1,
+        )
+        | ("CompanionTransient", 0 | 1 | 2 | 4)
+        | ("Glasses", 12)
+        | ("Achievement", 2)
+        | (
+            "EventItemHelp"
+            | "ContentFinderConditionTransient"
+            | "ActionTransient"
+            | "TraitTransient"
+            | "MountTransient"
+            | "OrnamentTransient",
+            _,
+        ) => Description,
+        _ => return None,
+    })
 }
 
 /// Columns, by the names the game map gives, that hold names.
@@ -90,21 +146,27 @@ pub struct BuiltIn {
     pub key: &'static str,
     pub en: &'static str,
     pub ru: &'static str,
+    pub en_hint: &'static str,
+    pub ru_hint: &'static str,
     pub entries: &'static [&'static str],
 }
 
 /// Names first, then descriptions and story text.
-pub const BUILT_IN: [BuiltIn; 10] = [
+pub const BUILT_IN: [BuiltIn; 12] = [
     BuiltIn {
         key: "items",
         en: "Items",
         ru: "Предметы",
+        en_hint: "Names and descriptions of items and key items.",
+        ru_hint: "Названия и описания предметов и ключевых предметов.",
         entries: &["Item", "EventItem", "EventItemHelp"],
     },
     BuiltIn {
         key: "duties",
         en: "Duties",
         ru: "Подземелья, испытания и рейды",
+        en_hint: "Dungeon, trial, and raid names and their Duty Finder descriptions.",
+        ru_hint: "Названия и описания в поиске групп.",
         entries: &[
             "ContentFinderCondition",
             "ContentFinderConditionTransient",
@@ -116,12 +178,16 @@ pub const BUILT_IN: [BuiltIn; 10] = [
         key: "places",
         en: "Places",
         ru: "Места",
+        en_hint: "Zone, area, town, and aetheryte names.",
+        ru_hint: "Названия зон, местностей, городов и эфиритов.",
         entries: &["PlaceName", "Town", "Aetheryte"],
     },
     BuiltIn {
         key: "actions",
         en: "Actions and statuses",
         ru: "Умения и эффекты",
+        en_hint: "Actions, traits, statuses, crafting and general actions, with their descriptions.",
+        ru_hint: "Умения, свойства, эффекты, ремесленные и общие действия с их описаниями.",
         entries: &[
             "Action",
             "ActionTransient",
@@ -139,18 +205,24 @@ pub const BUILT_IN: [BuiltIn; 10] = [
         key: "jobs",
         en: "Classes and jobs",
         ru: "Классы и профессии",
+        en_hint: "Class and job names.",
+        ru_hint: "Названия классов и профессий.",
         entries: &["ClassJob", "ClassJobCategory"],
     },
     BuiltIn {
         key: "characters",
         en: "Character names",
         ru: "Имена персонажей",
+        en_hint: "Names of NPCs and enemies.",
+        ru_hint: "Имена NPC и противников.",
         entries: &["ENpcResident", "BNpcName"],
     },
     BuiltIn {
         key: "collections",
         en: "Mounts, minions, and accessories",
-        ru: "Ездовые, компаньоны и аксессуары",
+        ru: "Ездовые животные, компаньоны и аксессуары",
+        en_hint: "Names and descriptions of mounts, minions, fashion accessories, and glasses.",
+        ru_hint: "Названия и описания ездовых животных, компаньонов, аксессуаров и очков.",
         entries: &[
             "Mount",
             "MountTransient",
@@ -166,19 +238,41 @@ pub const BUILT_IN: [BuiltIn; 10] = [
         key: "achievements",
         en: "Achievements and titles",
         ru: "Достижения и титулы",
+        en_hint: "Achievement names and descriptions, and titles.",
+        ru_hint: "Названия и описания достижений, титулы.",
         entries: &["Achievement", "Title"],
     },
     BuiltIn {
         key: "quest_names",
         en: "Quest names",
         ru: "Названия квестов",
+        en_hint: "Quest titles in the journal and the quest list.",
+        ru_hint: "Названия квестов в журнале и списке заданий.",
         entries: &["Quest"],
     },
     BuiltIn {
         key: "story",
-        en: "Story and dialogue",
-        ru: "Сюжет и диалоги",
-        entries: &["quest/*", "cut_scene/*", "custom/*"],
+        en: "Quest text",
+        ru: "Тексты квестов",
+        en_hint: "Dialogue and journal text of quests.",
+        ru_hint: "Диалоги и тексты журнала квестов.",
+        entries: &["quest/*"],
+    },
+    BuiltIn {
+        key: "cutscenes",
+        en: "Cutscenes",
+        ru: "Сюжетные сцены",
+        en_hint: "Cutscene subtitles.",
+        ru_hint: "Субтитры сюжетных сцен.",
+        entries: &["cut_scene/*"],
+    },
+    BuiltIn {
+        key: "custom",
+        en: "NPC conversations and menus",
+        ru: "Разговоры с NPC и меню",
+        en_hint: "Talk with NPCs outside quests, with the choices of their menus (the summoning bell and the like).",
+        ru_hint: "Разговоры с NPC вне квестов вместе с пунктами их меню (колокольчик вызова и т. п.).",
+        entries: &["custom/*"],
     },
 ];
 
@@ -213,6 +307,10 @@ pub struct SavedGroup {
 pub struct Coverage {
     #[serde(default)]
     pub groups: Vec<SavedGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy: Option<Vec<SavedGroup>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    rules: BTreeMap<String, Keep>,
 }
 
 /// A group as the player sees it.
@@ -253,6 +351,16 @@ fn covers<'a>(entry: &'a str, sheet: &str) -> Covers<'a> {
 }
 
 impl Group {
+    #[must_use]
+    pub fn hint(&self, russian: bool) -> Option<&'static str> {
+        let group = built_in(&self.key)?;
+        Some(if russian {
+            group.ru_hint
+        } else {
+            group.en_hint
+        })
+    }
+
     /// The group's name in the interface's language.
     #[must_use]
     pub fn title(&self, russian: bool) -> String {
@@ -319,7 +427,156 @@ pub enum SheetKeep {
     Columns(Vec<u16>),
 }
 
+impl SheetKeep {
+    #[must_use]
+    pub fn keeps(&self, column: u16) -> bool {
+        match self {
+            Self::Translate => false,
+            Self::Original => true,
+            Self::Columns(columns) => columns.contains(&column),
+        }
+    }
+}
+
 impl Coverage {
+    /// Freezes the effective choices of an older installation before groups become filters.
+    pub fn separate_groups(&mut self) {
+        if self.legacy.is_some() {
+            return;
+        }
+        let saved = self.policy_groups();
+        self.legacy = Some(
+            saved
+                .into_iter()
+                .filter(|group| {
+                    group.names == Keep::Original
+                        || group.descriptions == Keep::Original
+                        || group.columns.values().any(|keep| *keep == Keep::Original)
+                })
+                .map(|group| SavedGroup {
+                    key: group.key,
+                    entries: Some(group.entries),
+                    names: group.names,
+                    descriptions: group.descriptions,
+                    columns: group.columns,
+                    ..SavedGroup::default()
+                })
+                .collect(),
+        );
+    }
+
+    #[must_use]
+    pub fn policy_groups(&self) -> Vec<Group> {
+        if let Some(legacy) = &self.legacy {
+            return legacy
+                .iter()
+                .map(|group| Group {
+                    key: group.key.clone(),
+                    name: None,
+                    built_in: false,
+                    entries: group.entries.clone().unwrap_or_default(),
+                    names: group.names,
+                    descriptions: group.descriptions,
+                    columns: group.columns.clone(),
+                    changed: false,
+                })
+                .collect();
+        }
+        let mut groups = self.groups();
+        // Older versions included both folders in the built-in story group.
+        if self
+            .groups
+            .iter()
+            .find(|g| g.key == "story")
+            .is_none_or(|g| g.entries.is_none())
+            && let Some(story) = groups.iter_mut().find(|g| g.key == "story")
+        {
+            story
+                .entries
+                .extend(["cut_scene/*".to_owned(), "custom/*".to_owned()]);
+        }
+        groups
+    }
+
+    pub fn mark_many(&mut self, entries: &[String], part: Option<Kind>, keep: Keep) {
+        self.separate_groups();
+        if let Some(part) = part {
+            for entry in entries {
+                if keep == Keep::Translate && self.rules.get(entry) == Some(&Keep::Original) {
+                    // Taking one part out of an explicitly kept sheet leaves
+                    // only its other part in the game's language.
+                    let other = match part {
+                        Kind::Name => Kind::Description,
+                        Kind::Description => Kind::Name,
+                    };
+                    self.rules.insert(entry.clone(), Keep::Translate);
+                    self.rules.insert(part_key(entry, other), Keep::Original);
+                }
+                self.rules.insert(part_key(entry, part), keep);
+            }
+        } else {
+            let targets: std::collections::BTreeSet<_> =
+                entries.iter().map(String::as_str).collect();
+            self.rules.retain(|key, _| {
+                let sheet = key.split_once('#').map_or(key.as_str(), |(sheet, _)| sheet);
+                !targets.contains(sheet)
+                    && !sheet
+                        .match_indices('/')
+                        .any(|(at, _)| targets.contains(format!("{}*", &sheet[..=at]).as_str()))
+            });
+            self.rules
+                .extend(entries.iter().cloned().map(|entry| (entry, keep)));
+        }
+    }
+
+    /// # Errors
+    /// When resolving the named columns for legacy coverage fails.
+    pub fn effective_sheet(
+        &self,
+        groups: &[Group],
+        sheet: &str,
+        layout: &[u16],
+        names: impl FnOnce() -> Result<Vec<(String, u16)>, String>,
+    ) -> Result<SheetKeep, String> {
+        let whole = self
+            .rules
+            .get(sheet)
+            .or_else(|| {
+                sheet
+                    .rmatch_indices('/')
+                    .find_map(|(at, _)| self.rules.get(&format!("{}*", &sheet[..=at])))
+            })
+            .copied();
+        let names_rule = self.rules.get(&part_key(sheet, Kind::Name)).copied();
+        let descriptions_rule = self.rules.get(&part_key(sheet, Kind::Description)).copied();
+        let fallback = match whole {
+            Some(Keep::Original) => SheetKeep::Original,
+            Some(Keep::Translate) => SheetKeep::Translate,
+            None => sheet_keep(groups, sheet, layout, names)?,
+        };
+        if names_rule.is_none() && descriptions_rule.is_none() {
+            return Ok(fallback);
+        }
+        let kept: Vec<_> = layout
+            .iter()
+            .copied()
+            .filter(|&column| {
+                let rule = match part_kind(sheet, column) {
+                    Some(Kind::Name) => names_rule,
+                    Some(Kind::Description) => descriptions_rule,
+                    None => None,
+                };
+                rule.map_or_else(|| fallback.keeps(column), |keep| keep == Keep::Original)
+            })
+            .collect();
+        Ok(if kept.is_empty() {
+            SheetKeep::Translate
+        } else if kept.len() == layout.len() {
+            SheetKeep::Original
+        } else {
+            SheetKeep::Columns(kept)
+        })
+    }
     /// The groups as the player sees them: the built-in ones with the
     /// player's changes, then the player's own in the order they were made.
     #[must_use]
@@ -544,8 +801,18 @@ impl Coverage {
     /// again.
     #[must_use]
     pub fn fingerprint(&self) -> String {
+        self.coverage_fingerprint(false)
+    }
+
+    /// The key used by earlier builds to stamp their compiled tables.
+    #[must_use]
+    pub fn previous_fingerprint(&self) -> String {
+        self.coverage_fingerprint(true)
+    }
+
+    fn coverage_fingerprint(&self, include_redundant_rules: bool) -> String {
         let kept: Vec<_> = self
-            .groups()
+            .policy_groups()
             .into_iter()
             .filter(|group| {
                 group.names == Keep::Original
@@ -561,7 +828,37 @@ impl Coverage {
                 )
             })
             .collect();
-        // Nothing kept is empty, as in the tables of earlier versions.
+        let rules: BTreeMap<_, _> = self
+            .rules
+            .iter()
+            .filter(|&(key, keep)| {
+                if include_redundant_rules {
+                    return true;
+                }
+                let (entry, part) = key
+                    .split_once('#')
+                    .map_or((key.as_str(), false), |(entry, _)| (entry, true));
+                let path = entry.strip_suffix("/*").unwrap_or(entry);
+                let inherited = part.then(|| self.rules.get(entry)).flatten().or_else(|| {
+                    path.rmatch_indices('/')
+                        .find_map(|(at, _)| self.rules.get(&format!("{}*", &path[..=at])))
+                });
+                if let Some(inherited) = inherited {
+                    return inherited != keep;
+                }
+                // An explicit translation is needed where a legacy rule can keep text.
+                *keep == Keep::Original
+                    || kept.iter().any(|(entries, _, _, _)| {
+                        entries.iter().any(|legacy| {
+                            let legacy = legacy.split(':').next().unwrap_or(legacy);
+                            entry_matches(legacy, entry) || entry_matches(entry, legacy)
+                        })
+                    })
+            })
+            .collect();
+        if !rules.is_empty() {
+            return serde_json::to_string(&(kept, rules)).unwrap_or_default();
+        }
         if kept.is_empty() {
             return String::new();
         }
@@ -648,6 +945,45 @@ pub fn sheet_keep(
 mod tests {
     use super::*;
 
+    #[test]
+    fn folder_scope_and_parts_can_override_older_group_marks_independently() {
+        let mut coverage = Coverage::default();
+        coverage.choose("story", Kind::Description, Keep::Original);
+        coverage.separate_groups();
+        coverage.remove("story");
+        let groups = coverage.policy_groups();
+        let effective = |coverage: &Coverage, sheet, columns: &[u16]| {
+            coverage
+                .effective_sheet(&groups, sheet, columns, || Ok(vec![]))
+                .unwrap()
+        };
+        assert_eq!(
+            effective(&coverage, "cut_scene/example", &[1]),
+            SheetKeep::Original
+        );
+        coverage.mark_many(&["quest/*".into()], None, Keep::Original);
+        coverage.mark_many(&["quest/001/One".into()], None, Keep::Translate);
+        assert_eq!(
+            effective(&coverage, "quest/001/One", &[1]),
+            SheetKeep::Translate
+        );
+        assert_eq!(
+            effective(&coverage, "quest/001/Two", &[1]),
+            SheetKeep::Original
+        );
+        coverage.mark_many(&["Item".into()], Some(Kind::Name), Keep::Original);
+        assert_eq!(
+            effective(&coverage, "Item", &[0, 2, 8, 9]),
+            SheetKeep::Columns(vec![0, 2, 9])
+        );
+        coverage.mark_many(&["Item".into()], None, Keep::Original);
+        coverage.mark_many(&["Item".into()], Some(Kind::Name), Keep::Translate);
+        assert_eq!(
+            effective(&coverage, "Item", &[0, 2, 8, 9, 12]),
+            SheetKeep::Columns(vec![8])
+        );
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     fn columns() -> Result<Vec<(String, u16)>, String> {
         Ok(vec![("name".into(), 9), ("description".into(), 8)])
@@ -657,7 +993,7 @@ mod tests {
     fn names_and_descriptions_are_kept_apart() {
         let mut coverage = Coverage::default();
         let groups = coverage.groups();
-        assert_eq!(groups.len(), 10);
+        assert_eq!(groups.len(), 12);
         assert_eq!(
             sheet_keep(&groups, "Item", &[0, 8, 9], columns),
             Ok(SheetKeep::Translate)
@@ -766,6 +1102,27 @@ mod tests {
         assert_eq!(coverage.fingerprint(), empty);
         coverage.choose("items", Kind::Name, Keep::Original);
         assert_ne!(coverage.fingerprint(), empty);
+    }
+
+    #[test]
+    fn undoing_a_mark_restores_the_applied_fingerprint() {
+        let mut coverage = Coverage::default();
+        let original = coverage.fingerprint();
+        for (entry, part) in [("Item", Some(Kind::Name)), ("quest/*", None)] {
+            let target = [entry.to_owned()];
+            coverage.mark_many(&target, part, Keep::Original);
+            assert_ne!(coverage.fingerprint(), original);
+            coverage.mark_many(&target, part, Keep::Translate);
+            assert_eq!(coverage.fingerprint(), original);
+        }
+
+        coverage.mark_many(&["quest/*".into()], None, Keep::Original);
+        let marked_folder = coverage.fingerprint();
+        let child = ["quest/001/One".into()];
+        coverage.mark_many(&child, None, Keep::Translate);
+        assert_ne!(coverage.fingerprint(), marked_folder);
+        coverage.mark_many(&child, None, Keep::Original);
+        assert_eq!(coverage.fingerprint(), marked_folder);
     }
 
     #[test]

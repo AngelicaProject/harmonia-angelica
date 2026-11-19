@@ -1,6 +1,6 @@
 //! Harmonia in a host with a scripted game: a pack goes from the import
 //! folder to translated rows at the next game start.
-use angelica_fake_game::ui::{Edited, Widget, WidgetRef};
+use angelica_fake_game::ui::{Edited, Tone, Widget, WidgetRef};
 use angelica_fake_game::{
     TestHost, build_component_in,
     game_files::{FakeGame, TextSheet},
@@ -261,12 +261,7 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
     wait(&test);
     assert!(!import.join("interop.hpk").exists());
     let shown = texts(&test);
-    assert!(
-        shown
-            .iter()
-            .any(|t| t.starts_with("Ready; it applies at the next game start.")),
-        "{shown:?}"
-    );
+    assert!(shown.iter().any(|t| t == "Translation ready."), "{shown:?}");
     assert!(shown.contains(&"Restart the game to turn on Interop test pack.".to_owned()));
 
     // The next game start.
@@ -275,7 +270,56 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
     start(&mut test);
     let shown = texts(&test);
     assert!(shown.iter().any(|t| t == "On"), "{shown:?}");
+    assert!(
+        shown.iter().any(|t| t == "For a different game version"),
+        "{shown:?}"
+    );
+    click(&test, "row-t0");
+    assert!(
+        texts(&test)
+            .iter()
+            .any(|text| text.starts_with("Pack contents: "))
+    );
+    choose_tab(&test, 2);
+    let pending = || {
+        test.host.plugin("harmonia").unwrap().windows()[0]
+            .status
+            .as_ref()
+            .is_some_and(|status| status.tone == Tone::Warning)
+    };
+    assert!(!pending());
+    test.toggle("harmonia", "main", "groups/1", true);
+    assert!(pending());
+    test.toggle("harmonia", "main", "groups/1", false);
+    assert!(!pending());
+    choose_tab(&test, 0);
 
+    check_applied_pack_diagnostics(&test);
+
+    // Removing asks first; Cancel keeps the translation.
+    click(&test, "remove-0");
+    test.frames(1);
+    assert_eq!(question(&test).first().map(String::as_str), Some("remove"));
+    click(&test, "remove-no");
+    test.frames(1);
+    assert!(question(&test).is_empty());
+    assert!(
+        texts(&test)
+            .iter()
+            .any(|t| t.starts_with("Interop test pack · "))
+    );
+    click(&test, "remove-0");
+    click(&test, "remove-yes");
+    test.frames(1);
+    assert!(question(&test).is_empty());
+    assert!(
+        !texts(&test)
+            .iter()
+            .any(|t| t.starts_with("Interop test pack"))
+    );
+}
+
+fn check_applied_pack_diagnostics(test: &TestHost) {
     let excel = &test.services().excel;
     let columns = addon().columns;
     let row = store_row(
@@ -318,36 +362,43 @@ fn a_pack_is_checked_installed_chosen_and_applied_at_the_next_start() {
         .to_upper(&mut name, true, false, |_| false);
     assert_eq!(name, "Паладин".as_bytes(), "ru is written in Cyrillic");
 
-    // Harmonia refreshes the counters once a second of frames.
-    click(&test, "row-t0");
+    // Actual replacements appear in the pack card without changing the version status.
     test.frames(61);
+    let shown = texts(test);
     assert!(
-        texts(&test).iter().any(|t| t == "Rows in the game: 3"),
-        "{:?}",
-        texts(&test)
+        shown.iter().any(|t| t == "For a different game version"),
+        "{shown:?}"
     );
-
-    // Removing asks first; Cancel keeps the translation.
-    click(&test, "remove-0");
-    test.frames(1);
-    assert_eq!(question(&test).first().map(String::as_str), Some("remove"));
-    click(&test, "remove-no");
-    test.frames(1);
-    assert!(question(&test).is_empty());
+    let plugin = test.host.plugin("harmonia").unwrap();
     assert!(
-        texts(&test)
+        plugin.windows()[0]
+            .widgets
             .iter()
-            .any(|t| t.starts_with("Interop test pack · "))
+            .all(|widget| !matches!(widget, Widget::Readout(_) | Widget::Meter(_)))
     );
-    click(&test, "remove-0");
-    click(&test, "remove-yes");
-    test.frames(1);
-    assert!(question(&test).is_empty());
-    assert!(
-        !texts(&test)
-            .iter()
-            .any(|t| t.starts_with("Interop test pack"))
-    );
+    assert!(shown.iter().any(|text| text == "Applied replacements: 3"));
+    choose_tab(test, 3);
+    let settings = plugin.windows();
+    let mut diagnostics = settings[0]
+        .widgets
+        .iter()
+        .skip_while(|widget| {
+            !matches!(
+                widget,
+                Widget::BeginSection(section)
+                    if section.id == "diagnostics" && !section.open_by_default
+            )
+        })
+        .take_while(|widget| !matches!(widget, Widget::EndSection));
+    assert!(diagnostics.any(|widget| matches!(
+        widget,
+        Widget::Fact(fact) if fact.name == "Game version"
+    )));
+    assert!(!settings[0].widgets.iter().any(|widget| matches!(
+        widget,
+        Widget::Fact(fact) if fact.name == "Applied replacements"
+    )));
+    choose_tab(test, 0);
 }
 
 /// Whether the Addon row 1 comes out translated.
@@ -365,7 +416,7 @@ fn translates(test: &TestHost) -> bool {
 }
 
 #[test]
-fn harmonia_in_dalamud_that_translated_the_previous_session_keeps_this_copy_off() {
+fn harmonia_translates_on_the_first_normal_launch_with_an_old_dalamud_marker() {
     let mut test = TestHost::new(Limits::default());
     let storage = test.folder.path().join("storage/harmonia");
     std::fs::create_dir_all(storage.join("import")).unwrap();
@@ -379,47 +430,25 @@ fn harmonia_in_dalamud_that_translated_the_previous_session_keeps_this_copy_off(
     wait(&test);
     let version = test.services().game.version();
 
-    // The plugin was approved in a running game, so session 1 is the next
-    // game start. It translates; Harmonia in Dalamud then answers it.
+    std::fs::write(storage.join("session.json"), r#"{"session":1}"#).unwrap();
+    std::fs::write(
+        storage.join("dalamud.json"),
+        format!(
+            r#"{{"format":1,"translating":true,"game_version":"{version}","angelica_session":1}}"#
+        ),
+    )
+    .unwrap();
+
+    let mut test = TestHost::in_folder(test.folder, Limits::default());
+    test.use_map(&TEXT_MAP, &[]);
+    test.install(MANIFEST, component()).unwrap();
+    test.host.watch_standby(|| true);
+    test.host.start_all();
+    assert!(!translates(&test));
+
     let mut test = TestHost::in_folder(test.folder, Limits::default());
     start(&mut test);
     assert!(translates(&test));
-    let answer = |session: u64, game_version: &str| {
-        std::fs::write(
-            storage.join("dalamud.json"),
-            format!(
-                r#"{{"format": 1, "translating": true, "game_version": "{game_version}", "angelica_session": {session}}}"#
-            ),
-        )
-        .unwrap();
-    };
-    answer(1, &version);
-
-    let mut test = TestHost::in_folder(test.folder, Limits::default());
-    start(&mut test);
-    assert!(
-        !translates(&test),
-        "Harmonia in Dalamud translated session 1"
-    );
-    assert!(
-        texts(&test)
-            .iter()
-            .any(|t| t
-                .starts_with("Harmonia in Dalamud translated the game in the previous session")),
-        "{:?}",
-        texts(&test)
-    );
-
-    // No answer in session 2: Dalamud did not load.
-    let mut test = TestHost::in_folder(test.folder, Limits::default());
-    start(&mut test);
-    assert!(translates(&test), "nothing answered session 2");
-
-    // An answer from another game build does not count.
-    answer(3, "2000.01.01.0000.0000");
-    let mut test = TestHost::in_folder(test.folder, Limits::default());
-    start(&mut test);
-    assert!(translates(&test), "the answer is for another game build");
 }
 
 #[test]
@@ -463,7 +492,7 @@ fn a_real_pack_compiles_within_the_job_limits() {
     wait(&test);
     eprintln!("prepared in {:?}: {:?}", started.elapsed(), texts(&test));
     assert!(
-        texts(&test).iter().any(|t| t.starts_with("Ready")),
+        texts(&test).iter().any(|t| t == "Translation ready."),
         "{:?}",
         texts(&test)
     );
@@ -531,7 +560,7 @@ fn a_pack_with_fonts_replaces_the_games_font_files_at_the_next_start() {
     click(&test, "install");
     wait(&test);
     assert!(
-        texts(&test).iter().any(|t| t.starts_with("Ready")),
+        texts(&test).iter().any(|t| t == "Translation ready."),
         "{:?}",
         texts(&test)
     );
@@ -539,10 +568,13 @@ fn a_pack_with_fonts_replaces_the_games_font_files_at_the_next_start() {
     let folder = test.folder;
     let mut test = TestHost::in_folder(folder, Limits::default());
     start(&mut test);
-    click(&test, "row-t0");
-    test.frames(1);
-    let shown = texts(&test);
-    assert!(shown.iter().any(|t| t.starts_with("Fonts: ")), "{shown:?}");
+    choose_tab(&test, 3);
+    let plugin = test.host.plugin("harmonia").unwrap();
+    assert!(plugin.windows()[0].widgets.iter().any(|widget| matches!(
+        widget,
+        Widget::Fact(fact)
+            if fact.name == "Replaced font files" && fact.value.parse::<u64>().is_ok_and(|n| n > 0)
+    )));
     let target = harmonia::pack::Pack::parse(&pack)
         .unwrap()
         .fonts
@@ -701,8 +733,36 @@ fn install_interop(test: &mut TestHost) {
     wait(test);
 }
 
+fn check_coverage_membership(test: &TestHost) {
+    click(test, "sheet-details-0");
+    assert_eq!(
+        question(test).first().map(String::as_str),
+        Some("coverage-details")
+    );
+    click(test, "details-groups");
+    assert_eq!(
+        question(test).first().map(String::as_str),
+        Some("coverage-groups")
+    );
+    let belongs_to_items = || {
+        let plugin = test.host.plugin("harmonia").unwrap();
+        let windows = plugin.windows();
+        let dialog = windows[0].dialog.as_ref().unwrap();
+        dialog.widgets.iter().find_map(|widget| match widget {
+            Widget::Checkbox(checkbox) if checkbox.id == "member-items" => Some(checkbox.checked),
+            _ => None,
+        })
+    };
+    assert_eq!(belongs_to_items(), Some(false));
+    test.toggle("harmonia", "coverage-groups", "member-items", true);
+    assert_eq!(belongs_to_items(), Some(true));
+    test.toggle("harmonia", "coverage-groups", "member-items", false);
+    assert_eq!(belongs_to_items(), Some(false));
+    click(test, "membership-done");
+}
+
 #[test]
-fn names_and_descriptions_stay_in_the_games_language_by_column() {
+fn a_coverage_group_filters_the_tree_without_owning_its_sheet_marks() {
     // Addon's column 0 is a name and column 2 a description, as the game
     // map names them.
     let addon = TextSheet::new(3, &[0, 2]).row(1, &[(0, "Hello"), (2, "World")]);
@@ -713,27 +773,50 @@ fn names_and_descriptions_stay_in_the_games_language_by_column() {
     start(&mut test);
     install_interop(&mut test);
 
-    // A group of the player's own with Addon, its descriptions in the
-    // game's language.
     choose_tab(&test, 2);
+    test.choose("harmonia", "main", "groups", 7);
+    let plugin = test.host.plugin("harmonia").unwrap();
+    let windows = plugin.windows();
+    let sidebar_title = windows[0]
+        .widgets
+        .iter()
+        .find_map(|widget| match widget {
+            Widget::BeginSplit(split) => split.labels.get(7),
+            _ => None,
+        })
+        .unwrap();
+    assert!(texts(&test).contains(sidebar_title));
+
+    // A group of the player's own with Addon.
     wait(&test);
     click(&test, "new-group");
     test.edit("harmonia", "main", "group-name", "Mine");
     click(&test, "rename-save");
     click(&test, "add-sheets");
     test.edit("harmonia", "main", "sheet-query", "Addon");
+    until(&test, |test| texts(test).iter().any(|t| t == "Addon"));
     click(&test, "add-0");
     click(&test, "adding-done");
-    let shown = texts(&test);
-    assert!(shown.iter().any(|t| t == "Addon"), "{shown:?}");
-    test.toggle("harmonia", "main", "descriptions", false);
+    until(&test, |test| texts(test).iter().any(|t| t == "Addon"));
+    check_coverage_membership(&test);
+    click(&test, "coverage-filters");
     assert!(
-        texts(&test).iter().any(|t| t
-            == "Restart the game to apply what stays in the game's language."
-            || t.starts_with("Restart the game to turn on")),
-        "{:?}",
-        texts(&test)
+        test.host.plugin("harmonia").unwrap().windows()[0]
+            .widgets
+            .iter()
+            .any(|widget| matches!(widget, Widget::Choice(choice) if choice.id == "coverage-show"))
     );
+    let row_is_checked = |test: &TestHost, expected| {
+        test.host.plugin("harmonia").unwrap().windows()[0].widgets.iter().any(|widget| {
+            matches!(widget, Widget::Checkbox(row) if row.id == "sheet-mark-0" && row.checked == expected)
+        })
+    };
+    test.toggle("harmonia", "main", "groups/13", true);
+    assert!(row_is_checked(&test, true));
+    test.toggle("harmonia", "main", "groups/13", false);
+    assert!(row_is_checked(&test, false));
+    test.toggle("harmonia", "main", "sheet-mark-0", true);
+    assert!(row_is_checked(&test, true));
     // The table is prepared again once the player stops changing it.
     test.advance(2.0);
     wait(&test);
@@ -742,16 +825,25 @@ fn names_and_descriptions_stay_in_the_games_language_by_column() {
     )
     .unwrap();
     assert_eq!(settings["coverage"]["groups"][0]["entries"][0], "Addon");
-    assert_eq!(
-        settings["coverage"]["groups"][0]["descriptions"],
-        "original"
-    );
+    assert_eq!(settings["coverage"]["rules"]["Addon"], "original");
+    click(&test, "group-actions");
+    click(&test, "delete");
+    click(&test, "delete-yes");
+    let settings: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(test.folder.path().join("storage/harmonia/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(settings["coverage"]["groups"], serde_json::json!([]));
+    assert_eq!(settings["coverage"]["rules"]["Addon"], "original");
 
     let folder = test.folder;
     let mut test = TestHost::in_folder(folder, Limits::default());
     test.name_columns("Addon", &[("name", 0), ("description", 2)]);
     start(&mut test);
-    assert!(!translates(&test), "the description stays in English");
+    assert!(
+        !translates(&test),
+        "the sheet stays in English after its group is removed"
+    );
     let quest_columns = quest().columns;
     let row = store_row(
         &test.services().excel,
@@ -766,6 +858,21 @@ fn names_and_descriptions_stay_in_the_games_language_by_column() {
         "Вторая".as_bytes(),
         "other sheets are translated"
     );
+}
+
+#[test]
+fn harmonia_command_toggles_its_window() {
+    let mut test = TestHost::new(Limits::default());
+    game_with(&[]).write(&test.game_folder()).unwrap();
+    start(&mut test);
+    let plugin = test.host.plugin("harmonia").unwrap();
+    assert_eq!(plugin.windows().len(), 1);
+
+    assert!(test.command("/harmonia"));
+    assert!(plugin.windows().is_empty());
+    assert!(test.command("/HARMONIA extra text"));
+    assert_eq!(plugin.windows().len(), 1);
+    assert!(test.game.printed_text().is_empty());
 }
 
 #[test]
@@ -836,8 +943,14 @@ fn the_first_run_suggests_a_translation_and_takes_a_link() {
             .any(|w| matches!(w, Widget::TextInput(input) if input.id == "feed"))
     );
 
-    // Settings are kept across starts.
     choose_tab(&test, 3);
+    let plugin = test.host.plugin("harmonia").unwrap();
+    assert!(plugin.windows()[0].widgets.iter().any(|widget| matches!(
+        widget,
+        Widget::Checkbox(checkbox) if checkbox.id == "auto-install" && checkbox.checked
+    )));
+
+    // An explicit choice to turn automatic installation off is saved.
     test.toggle("harmonia", "main", "auto-install", false);
     test.choose("harmonia", "main", "interval", 5);
     let settings: serde_json::Value = serde_json::from_slice(
@@ -853,28 +966,54 @@ fn the_first_run_suggests_a_translation_and_takes_a_link() {
 fn a_real_packs_sheet_list_loads_within_a_frame() {
     let pack = std::env::var("HARMONIA_PACK").expect("HARMONIA_PACK");
     let mut test = TestHost::new(Limits::default());
-    let import = test.folder.path().join("storage/harmonia/import");
-    std::fs::create_dir_all(&import).unwrap();
-    std::fs::copy(&pack, import.join("real.hpk")).unwrap();
+    let bytes = std::fs::read(&pack).unwrap();
+    let pack = harmonia::pack::Pack::parse(&bytes).unwrap();
+    let manifest = &pack.manifest;
+    let translation = harmonia::library::Translation {
+        hash: pack.hash_hex(),
+        title: manifest.title.clone(),
+        team: manifest.team.name.clone(),
+        version: manifest.version.clone(),
+        channel: manifest.channel.clone(),
+        language: manifest.language.clone(),
+        game_language: manifest.game.language.clone(),
+        game_version: manifest.game.version.clone(),
+        key: None,
+        sheets: pack.sheet_count(),
+        cells: pack.cell_count(),
+        feed: None,
+        changelog: None,
+    };
+    let storage = test.folder.path().join("storage/harmonia");
+    std::fs::create_dir_all(storage.join("packs")).unwrap();
+    std::fs::write(storage.join(translation.pack_path()), bytes).unwrap();
+    std::fs::write(
+        storage.join("translations.json"),
+        serde_json::to_vec(&[translation]).unwrap(),
+    )
+    .unwrap();
     start(&mut test);
-    click(&test, "check-0");
-    wait(&test);
-    click(&test, "install");
-    wait(&test);
 
     // The sheet list of a real pack loads within a frame's fuel.
     let started = std::time::Instant::now();
     choose_tab(&test, 2);
-    for _ in 0..3000 {
-        test.frames(1);
-        let plugin = test.host.plugin("harmonia").unwrap();
-        assert_eq!(plugin.status(), Status::Running);
-        if !has_progress(&test) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    until(&test, |test| {
+        assert_eq!(
+            test.host.plugin("harmonia").unwrap().status(),
+            Status::Running
+        );
+        test.host.plugin("harmonia").unwrap().windows()[0]
+            .widgets
+            .iter()
+            .any(|w| matches!(w, Widget::Checkbox(checkbox) if checkbox.id == "sheet-mark-0"))
+    });
 
+    test.choose("harmonia", "main", "coverage-list", 96);
+    until(&test, |test| {
+        test.host.plugin("harmonia").unwrap().windows()[0].widgets.iter().any(|widget| {
+            matches!(widget, Widget::BeginVirtualList(list) if list.first == 96 && list.total > 96)
+        })
+    });
     let storage = test.folder.path().join("storage/harmonia/tables");
     let size: u64 = std::fs::read_dir(&storage)
         .unwrap()
@@ -888,8 +1027,19 @@ fn a_real_packs_sheet_list_loads_within_a_frame() {
         Status::Running
     );
     let started = std::time::Instant::now();
-    click(&test, "group-story");
-    test.frames(1);
+    test.choose("harmonia", "main", "groups", 10);
+    until(&test, |test| {
+        assert_eq!(
+            test.host.plugin("harmonia").unwrap().status(),
+            Status::Running
+        );
+        let shown = texts(test);
+        shown.iter().any(|text| text == "Quest text")
+            && test.host.plugin("harmonia").unwrap().windows()[0]
+                .widgets
+                .iter()
+                .any(|w| matches!(w, Widget::Button(button) if button.label.ends_with(" quest")))
+    });
     eprintln!(
         "a group shown in {:?}: {:?}",
         started.elapsed(),

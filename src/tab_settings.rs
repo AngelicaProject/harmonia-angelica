@@ -1,6 +1,6 @@
 //! The Settings tab: how updates arrive, and the dictionary's languages.
-use crate::{Harmonia, library::CHECK_CHOICES, names};
-use angelica_sdk::ui::Window;
+use crate::{Harmonia, count, library::CHECK_CHOICES, names};
+use angelica_sdk::{api::runtime, ui::Window};
 
 /// A language's name in itself, as the dictionary shows it.
 pub(crate) fn endonym(tag: &str) -> &'static str {
@@ -66,7 +66,48 @@ impl Harmonia {
                 self.settings.dictionary_languages.iter().any(|t| t == tag),
             );
         }
+        window.section(
+            "diagnostics",
+            self.tr("Diagnostics", "Диагностика"),
+            false,
+            |window| self.diagnostics(window),
+        )
+    }
+
+    fn diagnostics(&self, mut window: Window) -> Window {
+        let version = runtime::game_version();
+        window = window.fact(
+            self.tr("Game version", "Версия игры"),
+            if version.is_empty() {
+                self.tr("Unknown", "Неизвестна")
+            } else {
+                &version
+            },
+        );
+        if let Some(at) = self.checked_at {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let minutes = ((self.clock - at) / 60.0).floor() as u64;
+            window = window.fact(
+                self.tr("Last update check", "Последняя проверка обновлений"),
+                match (minutes, self.russian) {
+                    (0, false) => "Just now".into(),
+                    (0, true) => "Только что".into(),
+                    (m, false) => format!("{m} min ago"),
+                    (m, true) => format!("{m} мин назад"),
+                },
+            );
+        }
         window
+    }
+
+    pub(crate) fn sheet_counts(&self, sheets: usize, cells: usize) -> String {
+        let sheets = count(sheets as u64, self.russian);
+        let cells = count(cells as u64, self.russian);
+        if self.russian {
+            format!("Листов {sheets}, ячеек {cells}")
+        } else {
+            format!("Sheets {sheets}, cells {cells}")
+        }
     }
 
     pub(crate) fn settings_toggled(&mut self, id: &str, checked: bool) {
