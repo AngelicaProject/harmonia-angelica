@@ -21,11 +21,6 @@
 //! name dictionary (`tab_dictionary`), what stays in the game's language
 //! (`tab_coverage`), and settings (`tab_settings`).
 //!
-//! Harmonia in Dalamud comes first: when it translated the game in the
-//! previous session on the same game build, this copy stays off for the
-//! session (`library::begin_session`). It is the translation for the days
-//! the game runs without Dalamud.
-//!
 //! Like the Dalamud build, Harmonia changes translations only at game
 //! start: the game copies text into its own caches, so a change in the
 //! middle of a session would show a mix.
@@ -33,6 +28,7 @@ pub mod atlas;
 pub mod catalog;
 pub mod compile;
 pub mod coverage;
+mod coverage_browser;
 pub mod fdt;
 pub mod feed;
 pub mod font_patch;
@@ -160,10 +156,13 @@ enum Job {
 enum Side {
     /// The catalog of a translation's sheets.
     Catalog(String),
+    Browse(u32),
     /// The name index, with its header.
     Names(String),
     /// A search in the name index; `chat` for one `/hfind` asked for.
-    Search { chat: bool },
+    Search {
+        chat: bool,
+    },
     /// The suggested translation's feed.
     Suggestion,
 }
@@ -210,8 +209,16 @@ impl Tab {
 struct CoverageView {
     /// The chosen group.
     group: Option<String>,
-    /// The entry of the group whose columns are shown.
-    entry: Option<String>,
+    filter: coverage_browser::Filter,
+    filters_open: bool,
+    group_actions: bool,
+    details: Option<coverage_browser::Row>,
+    revision: u32,
+    scroll_epoch: u32,
+    browser: Option<coverage_browser::View>,
+    browser_revision: Option<u32>,
+    browse_error: Option<String>,
+    membership: Option<String>,
     /// The search for sheets to add, while it is open.
     adding: Option<String>,
     /// The new name, while the group is renamed.
@@ -221,9 +228,6 @@ struct CoverageView {
     catalog: Option<catalog::Catalog>,
     /// The catalog while it is read from its file.
     loader: Option<catalog::Loader>,
-    /// The sheets the search for sheets to add found: the query, the
-    /// first ones, and how many there are.
-    found: Option<(String, Vec<String>, usize)>,
     /// Why the catalog could not be made.
     failed: Option<String>,
 }
@@ -257,10 +261,9 @@ struct Harmonia {
     applied: Option<String>,
     /// The coverage of the table applied in this session.
     applied_coverage: Option<String>,
+    coverage_fingerprint: String,
     /// What the applied table holds.
     summary: Option<compile::Summary>,
-    /// Harmonia in Dalamud translates this session, so this copy does not.
-    yielded: bool,
     started_with_game: bool,
     imports: Vec<(String, u64)>,
     inspection: Option<Inspection>,
@@ -404,13 +407,14 @@ impl Harmonia {
             .unwrap_or(angelica_sdk::excel::ENGLISH)
     }
 
-    /// Whether the table of `hash` was built by this table format with the
-    /// current coverage and its fonts from the running game's files.
+    /// Whether the table uses the current compiler rules and coverage, and
+    /// its fonts were built from the running game's files.
     fn table_is_current(&self, hash: &str) -> bool {
         matches!(
             library::load_stamp(hash),
-            Ok(Some(stamp)) if stamp.table_format == compile::TABLE_FORMAT
-                && stamp.coverage == self.settings.coverage.fingerprint()
+            Ok(Some(stamp)) if stamp.table_revision == compile::TABLE_REVISION
+                && (stamp.coverage == self.coverage_fingerprint
+                    || stamp.coverage == self.settings.coverage.previous_fingerprint())
                 && stamp.game_version == runtime::game_version()
         )
     }
@@ -434,7 +438,7 @@ impl Harmonia {
         let (cells, sheets) = (table.info().rules, table.info().parts);
         self.table = Some(table);
         self.applied = Some(hash.to_owned());
-        self.applied_coverage = Some(self.settings.coverage.fingerprint());
+        self.applied_coverage = Some(self.coverage_fingerprint.clone());
         angelica_sdk::info(&format!(
             "{} {}: {cells} cells in {sheets} sheets ready; the game translates them as it loads its text.",
             translation.title, translation.version
@@ -585,6 +589,7 @@ impl Harmonia {
     /// The coverage changed: saved now, the table prepared again once the
     /// player stops changing it.
     fn coverage_changed(&mut self) {
+        self.coverage_fingerprint = self.settings.coverage.fingerprint();
         self.save();
         self.settle = Some(SETTLE);
     }
@@ -639,33 +644,11 @@ impl Harmonia {
             }
             Job::Compile(hash) => {
                 let stamp: Stamp = serde_json::from_slice(output).map_err(|e| e.to_string())?;
-                let reserved = if stamp.summary.reserved > 0 {
-                    words(
-                        format!(
-                            " {} cells hold reserved game tokens and are not written.",
-                            stamp.summary.reserved
-                        ),
-                        format!(
-                            " Не записаны ячейки с зарезервированными знаками игры: {}.",
-                            stamp.summary.reserved
-                        ),
-                    )
-                } else {
-                    String::new()
-                };
-                self.say(
-                    words(
-                        format!(
-                            "Ready; it applies at the next game start. {} cells in {} sheets.{reserved}",
-                            stamp.summary.cells, stamp.summary.sheets
-                        ),
-                        format!(
-                            "Готово; применится при следующем запуске игры. Ячеек: {}, листов: {}.{reserved}",
-                            stamp.summary.cells, stamp.summary.sheets
-                        ),
-                    ),
-                    Tone::Good,
-                );
+                angelica_sdk::info(&format!(
+                    "Prepared {} cells in {} sheets. Skipped {} reserved cells.",
+                    stamp.summary.cells, stamp.summary.sheets, stamp.summary.reserved,
+                ));
+                self.say(self.tr("Translation ready.", "Перевод готов."), Tone::Good);
                 if self
                     .coverage
                     .catalog
@@ -693,6 +676,18 @@ impl Harmonia {
                     self.coverage.failed = Some(error);
                 }
             },
+            Side::Browse(revision) if revision == self.coverage.revision => {
+                match output
+                    .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+                {
+                    Ok(view) => {
+                        self.coverage.browser = Some(view);
+                        self.coverage.browser_revision = Some(revision);
+                    }
+                    Err(error) => self.coverage.browse_error = Some(error),
+                }
+            }
+            Side::Browse(_) => {}
             Side::Names(header) => match output.and_then(|bytes| {
                 serde_json::from_slice::<names::Built>(&bytes).map_err(|e| e.to_string())
             }) {
@@ -1062,15 +1057,6 @@ impl Harmonia {
     /// applied.
     fn status_line(&self) -> (String, Tone) {
         let words = |en: &str, ru: &str| self.tr(en, ru).to_owned();
-        if self.yielded {
-            return (
-                words(
-                    "Harmonia in Dalamud translates",
-                    "Переводит Harmonia в Dalamud",
-                ),
-                Tone::Muted,
-            );
-        }
         if self.restart_line().is_some() {
             return (
                 words("Restart the game", "Перезапустите игру"),
@@ -1100,9 +1086,6 @@ impl Harmonia {
     /// The one line that asks for a restart, while the game runs with
     /// another translation or coverage than the chosen one.
     fn restart_line(&self) -> Option<String> {
-        if self.yielded {
-            return None;
-        }
         if self.applied != self.settings.active {
             return Some(
                 match self
@@ -1123,43 +1106,13 @@ impl Harmonia {
             );
         }
         (self.applied.is_some()
-            && self.applied_coverage.as_deref() != Some(&self.settings.coverage.fingerprint()))
+            && self.applied_coverage.as_deref() != Some(self.coverage_fingerprint.as_str()))
         .then(|| {
             words(
-                "Restart the game to apply what stays in the game's language.",
-                "Перезапустите игру, чтобы применить, что остаётся на языке игры.",
+                "Restart the game to apply coverage settings.",
+                "Перезапустите игру, чтобы применить настройки охвата.",
             )
         })
-    }
-
-    /// What the last check of `url` found, in words, and whether it is a
-    /// problem.
-    fn feed_state(&self, url: &str) -> (String, bool) {
-        let view = self
-            .feeds
-            .iter()
-            .find(|(feed, _)| feed == url)
-            .map(|(_, view)| &view.status);
-        match view {
-            None => (
-                self.tr("Not checked yet.", "Ещё не проверялось.")
-                    .to_owned(),
-                false,
-            ),
-            Some(FeedStatus::UpToDate) => (
-                self.tr("Up to date.", "Актуальная версия.").to_owned(),
-                false,
-            ),
-            Some(FeedStatus::Available(release)) => (
-                if self.russian {
-                    format!("Доступна версия {}.", release.version)
-                } else {
-                    format!("Version {} is available.", release.version)
-                },
-                false,
-            ),
-            Some(FeedStatus::Problem(reason)) => (reason.clone(), true),
-        }
     }
 
     /// The build the name index must come from now.
@@ -1325,8 +1278,8 @@ impl Harmonia {
                     catalog.quests.len()
                 ));
                 self.coverage.loader = None;
-                self.coverage.found = None;
                 self.coverage.catalog = Some(catalog);
+                self.invalidate_coverage_view();
             }
             Err(error) => {
                 angelica_sdk::warning(&format!("The sheet list could not be read: {error}"));
@@ -1404,6 +1357,18 @@ impl Harmonia {
         }
     }
 
+    fn open_window(&mut self) {
+        self.open = true;
+        self.imports = library::imports();
+        if self.library.is_empty() && self.suggestion.is_none() {
+            let input = FeedsInput {
+                feeds: vec![SUGGESTED_FEED.to_owned()],
+                testing: false,
+            };
+            self.start_side("feeds", &input, Side::Suggestion);
+        }
+    }
+
     fn open_tab(&mut self, tab: Tab) {
         self.tab = tab;
         match tab {
@@ -1422,15 +1387,17 @@ impl Harmonia {
 
 impl Plugin for Harmonia {
     fn start() -> Result<Self, String> {
+        let settings = library::load_settings()?;
+        let coverage_fingerprint = settings.coverage.fingerprint();
         let mut plugin = Self {
             open: false,
             tab: Tab::Translation,
             library: library::load_library()?,
-            settings: library::load_settings()?,
+            settings,
             applied: None,
             applied_coverage: None,
+            coverage_fingerprint,
             summary: None,
-            yielded: false,
             started_with_game: runtime::started_with_game(),
             imports: library::imports(),
             inspection: None,
@@ -1468,32 +1435,17 @@ impl Plugin for Harmonia {
             russian: runtime::language() == "ru",
         };
         let _ = storage::remove(feed::DOWNLOAD);
-        if plugin.started_with_game {
-            // Without the count this copy cannot tell, and translates.
-            plugin.yielded = match library::begin_session(&runtime::game_version()) {
-                Ok(yielded) => yielded,
-                Err(error) => {
-                    angelica_sdk::warning(&format!("The session is not counted: {error}"));
-                    false
-                }
-            };
-            if plugin.yielded {
-                angelica_sdk::info(
-                    "Harmonia in Dalamud translated the previous session on this game build; this copy stays off.",
-                );
-            }
-            if !plugin.yielded
-                && let Some(hash) = plugin.settings.active.clone()
-                && let Err(reason) = plugin.apply(&hash)
-            {
-                plugin.say(
-                    words(
-                        format!("No translation in this session: {reason}"),
-                        format!("В этой игре без перевода: {reason}"),
-                    ),
-                    Tone::Warning,
-                );
-            }
+        if plugin.started_with_game
+            && let Some(hash) = plugin.settings.active.clone()
+            && let Err(reason) = plugin.apply(&hash)
+        {
+            plugin.say(
+                words(
+                    format!("No translation in this session: {reason}"),
+                    format!("В этой игре без перевода: {reason}"),
+                ),
+                Tone::Warning,
+            );
         }
         let find = commands::Command::new(
             "hfind",
@@ -1506,8 +1458,19 @@ impl Plugin for Harmonia {
             "name",
             words("The name, in any language", "Название на любом языке"),
         ));
-        if let Err(error) = commands::define(&[find]) {
-            angelica_sdk::warning(&format!("/hfind is not available: {}", error.message));
+        let window = commands::Command::new(
+            "harmonia",
+            words(
+                "Opens or closes Harmonia",
+                "Открывает или закрывает Harmonia",
+            ),
+        )
+        .parameter(commands::Parameter::text("text", "").optional());
+        if let Err(error) = commands::define(&[window, find]) {
+            angelica_sdk::warning(&format!(
+                "/harmonia and /hfind are not available: {}",
+                error.message
+            ));
         }
         Ok(plugin)
     }
@@ -1535,7 +1498,7 @@ impl Plugin for Harmonia {
         }
         self.poll_side()?;
         self.load_catalog();
-        self.refresh_found();
+        self.refresh_coverage_view();
         if let Some(left) = &mut self.settle {
             *left -= elapsed;
         }
@@ -1601,17 +1564,7 @@ impl Plugin for Harmonia {
 
     fn ui_event(&mut self, event: Event) {
         match event {
-            Event::OpenRequested => {
-                self.open = true;
-                self.imports = library::imports();
-                if self.library.is_empty() && self.suggestion.is_none() {
-                    let input = FeedsInput {
-                        feeds: vec![SUGGESTED_FEED.to_owned()],
-                        testing: false,
-                    };
-                    self.start_side("feeds", &input, Side::Suggestion);
-                }
-            }
+            Event::OpenRequested => self.open_window(),
             // Closing a question is the same as not answering it.
             Event::Closed(place) if place == "trust" => {
                 self.translation_click("distrust");
@@ -1619,6 +1572,8 @@ impl Plugin for Harmonia {
             Event::Closed(place) if place == "install" => self.cancel_inspection(),
             Event::Closed(place) if place == "remove" => self.removing = None,
             Event::Closed(place) if place == "delete-group" => self.coverage.deleting = None,
+            Event::Closed(place) if place == "coverage-details" => self.coverage.details = None,
+            Event::Closed(place) if place == "coverage-groups" => self.coverage.membership = None,
             Event::Closed(_) => self.open = false,
             Event::Clicked(target) => self.click(&target.id),
             Event::Chosen(chosen) if chosen.id == "tab" => {
@@ -1626,15 +1581,20 @@ impl Plugin for Harmonia {
                     self.open_tab(*tab);
                 }
             }
-            Event::Chosen(chosen) if chosen.id == "groups" => self.coverage_chosen(chosen.index),
+            Event::Chosen(chosen) if self.tab == Tab::Coverage => {
+                self.coverage_chosen(&chosen.id, chosen.index);
+            }
             Event::Chosen(chosen) => self.settings_chosen(&chosen.id, chosen.index),
             Event::Navigated(navigated) => {
                 if navigated.depth == 0 {
                     self.open_tab(Tab::Translation);
                 } else if self.tab == Tab::Coverage {
-                    self.coverage.entry = None;
                     self.coverage.adding = None;
+                    self.invalidate_coverage_view();
                 }
+            }
+            Event::Toggled(toggled) if toggled.window == "coverage-groups" => {
+                self.coverage_membership_toggled(&toggled.id, toggled.checked);
             }
             Event::Toggled(toggled) => {
                 if self.tab == Tab::Coverage {
@@ -1650,11 +1610,9 @@ impl Plugin for Harmonia {
                     self.dictionary.again = true;
                     self.dictionary.chosen = None;
                 }
-                "sheet-query" => {
-                    self.coverage.adding = Some(edited.value);
-                    self.coverage.found = None;
+                "sheet-query" | "coverage-query" | "group-name" => {
+                    self.coverage_edited(&edited.id, edited.value);
                 }
-                "group-name" => self.coverage.renaming = Some(edited.value),
                 _ => {}
             },
             _ => {}
@@ -1662,6 +1620,14 @@ impl Plugin for Harmonia {
     }
 
     fn command(&mut self, invocation: commands::Invocation) -> Result<(), String> {
+        if invocation.is(&["harmonia"]) {
+            if self.open {
+                self.open = false;
+            } else {
+                self.open_window();
+            }
+            return Ok(());
+        }
         if !invocation.is(&["hfind"]) {
             return Ok(());
         }
@@ -1740,6 +1706,10 @@ impl Plugin for Harmonia {
                 storage::write(&catalog::path(&hash), text.as_bytes()).map_err(|e| e.message)?;
                 Ok(text.into_bytes())
             }
+            "browse-coverage" => {
+                let request = serde_json::from_slice(&input).map_err(|e| e.to_string())?;
+                serde_json::to_vec(&coverage_browser::load(request)?)
+            }
             "names" => {
                 let wanted: names::Build =
                     serde_json::from_slice(&input).map_err(|e| e.to_string())?;
@@ -1788,9 +1758,9 @@ fn compile_job(input: CompileInput) -> Result<Stamp, String> {
         0.6,
         &words("Preparing the translation", "Подготовка перевода"),
     );
-    let groups = input.coverage.groups();
+    let groups = input.coverage.policy_groups();
     let (table, summary) = compile::compile(&pack, |sheet, layout| {
-        coverage::sheet_keep(&groups, sheet, layout, || {
+        input.coverage.effective_sheet(&groups, sheet, layout, || {
             Ok(angelica_sdk::excel::sheet(sheet)
                 .map(|info| info.fields.into_iter().map(|f| (f.name, f.index)).collect())
                 .unwrap_or_default())
@@ -1802,7 +1772,7 @@ fn compile_job(input: CompileInput) -> Result<Stamp, String> {
     storage::write(&library::table_path(&input.hash), &table).map_err(|e| e.message)?;
     let stamp = Stamp {
         hash: input.hash,
-        table_format: compile::TABLE_FORMAT,
+        table_revision: compile::TABLE_REVISION,
         coverage: input.coverage.fingerprint(),
         summary,
         game_version: runtime::game_version(),

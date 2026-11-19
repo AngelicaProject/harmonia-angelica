@@ -6,6 +6,20 @@ use crate::coverage::SheetKeep;
 use crate::pack::{GUARD_DOMAIN, Pack};
 use angelica_sdk::text::table::{Column, Variant, Writer};
 
+/// Revision of the compiler's rules for which cells go into a cached table.
+pub(crate) const TABLE_REVISION: u32 = 2;
+
+// Event scripts send these default names to the server, which expects the
+// client-language text. Keep the same Addon rows as Harmonia's ServerNames.
+fn is_server_name(sheet: &str, row: u32) -> bool {
+    sheet == "Addon" && matches!(row, 6487 | 6489 | 6710 | 6888)
+}
+
+// TextCommandParam and these TextCommand columns contain executable syntax.
+fn is_command_token(sheet: &str, column: u16) -> bool {
+    sheet == "TextCommand" && matches!(column, 5 | 6 | 8 | 9)
+}
+
 /// The game's language number for a pack's `game.language` tag.
 #[must_use]
 pub fn game_language(tag: &str) -> Option<u8> {
@@ -47,23 +61,6 @@ pub fn cyrillic_letters() -> Vec<(char, char)> {
         .collect()
 }
 
-/// What a table leaves out of a pack whatever the coverage; a table of
-/// another format is built again.
-pub const TABLE_FORMAT: u32 = 1;
-
-/// Text the game sends to the server: the default name an event script reads
-/// with `GetAddonText` when the player buys an apartment or private chambers
-/// or registers a company airship or submersible. The server refuses a
-/// translated name ("Failed to complete housing action."), so these rows stay
-/// in the game's language (`HarmoniaEngine`'s `Runtime/ServerNames.cs`).
-const SERVER_NAME_SHEET: &str = "Addon";
-const SERVER_NAME_ROWS: [u32; 4] = [6487, 6489, 6710, 6888];
-
-#[must_use]
-pub fn is_server_name(sheet: &str, row: u32) -> bool {
-    sheet == SERVER_NAME_SHEET && SERVER_NAME_ROWS.contains(&row)
-}
-
 /// What the table holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Summary {
@@ -79,9 +76,10 @@ pub struct Summary {
     pub reserved: usize,
 }
 
-/// The table for `pack`, without what `keep` leaves in the game's language
-/// and the names the game sends to the server: `keep` is asked once per sheet
-/// with the sheet's name and its columns' positions.
+/// The table for `pack`, without what `keep` leaves in the game's language:
+/// it is asked once per sheet with the sheet's name and its columns'
+/// positions. Default names sent to the server always stay in the game's
+/// language.
 ///
 /// # Errors
 /// When the pack's game language is not one the game has, the pack does
@@ -101,6 +99,11 @@ pub fn compile(
         reserved: 0,
     };
     for sheet in pack.sheets() {
+        if sheet.name == "TextCommandParam" {
+            summary.kept_sheets += 1;
+            summary.kept_cells += sheet.cells().count();
+            continue;
+        }
         let positions: Vec<u16> = sheet.layout.iter().map(|column| column.index).collect();
         let kept = match keep(sheet.name, &positions)? {
             SheetKeep::Original => {
@@ -129,7 +132,10 @@ pub fn compile(
             .map_err(|e| e.to_string())?;
         for cell in sheet.cells() {
             let column = sheet.layout[usize::from(cell.ordinal)].index;
-            if kept.contains(&column) || is_server_name(sheet.name, cell.row) {
+            if kept.contains(&column)
+                || is_server_name(sheet.name, cell.row)
+                || is_command_token(sheet.name, column)
+            {
                 summary.kept_cells += 1;
                 continue;
             }
@@ -160,6 +166,17 @@ mod tests {
     use angelica_sdk::text::table::Table;
 
     const INTEROP: &[u8] = include_bytes!("../tests/data/harmonia-interop.hpk");
+
+    #[test]
+    fn command_tokens_are_reserved_without_reserving_descriptions() {
+        for column in 0..=10 {
+            assert_eq!(
+                is_command_token("TextCommand", column),
+                [5, 6, 8, 9].contains(&column)
+            );
+            assert!(!is_command_token("Addon", column));
+        }
+    }
 
     #[test]
     fn every_pack_cell_becomes_a_table_cell() {
@@ -216,13 +233,6 @@ mod tests {
                 assert!(row.iter().all(|c| c.column != first));
             }
         }
-    }
-
-    #[test]
-    fn server_names_stay_untranslated() {
-        assert!(is_server_name("Addon", 6710) && is_server_name("Addon", 6487));
-        assert!(is_server_name("Addon", 6489) && is_server_name("Addon", 6888));
-        assert!(!is_server_name("Addon", 6711) && !is_server_name("Item", 6710));
     }
 
     #[test]

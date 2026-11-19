@@ -707,6 +707,36 @@ mod tests {
     const REPLACEMENTS: &[u8] = include_bytes!("../tests/data/harmonia-interop-replacements.hpk");
 
     #[test]
+    fn the_compiled_table_omits_the_server_names_but_keeps_other_translations() {
+        for row in [6487u32, 6489, 6710, 6888] {
+            let pack = Pack::parse(INTEROP).unwrap();
+            let index = pack
+                .sheets()
+                .position(|sheet| sheet.name == "Addon")
+                .unwrap();
+            let sheet_record = &pack.sheets[index * SHEET_RECORD..];
+            let start = u32_at(sheet_record, 20) as usize * ROW_RECORD;
+            let last_addon_row = start + ROW_RECORD;
+            assert_eq!(u32_at(pack.rows, last_addon_row), 7);
+            // Reuse the verified fixture layout with a protected row ID on its second Addon row.
+            let mut rows = pack.rows.to_vec();
+            rows[last_addon_row..last_addon_row + 4].copy_from_slice(&row.to_le_bytes());
+            let changed = Pack {
+                rows: &rows,
+                ..pack
+            };
+            let (bytes, summary) =
+                crate::compile::compile(&changed, |_, _| Ok(crate::coverage::SheetKeep::Translate))
+                    .unwrap();
+            let table = angelica_sdk::text::table::Table::parse(&bytes).unwrap();
+            let addon = table.sheet("Addon").unwrap();
+            assert!(!addon.row(1, 0).is_empty());
+            assert!(addon.row(row, 0).is_empty());
+            assert_eq!(summary.cells + summary.kept_cells, changed.cell_count());
+        }
+    }
+
+    #[test]
     fn reads_the_font_sections() {
         assert!(Pack::parse(INTEROP).unwrap().fonts.is_none());
         let fonts = Pack::parse(FONTS).unwrap();

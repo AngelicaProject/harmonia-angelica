@@ -5,7 +5,10 @@ use crate::{
     FeedStatus, Harmonia, Inspection, Job, SUGGESTED_FEED, count, language_name, library,
     megabytes, short, words,
 };
-use angelica_sdk::ui::{ActionKind, Dialog, Entry, Mark, Meter, Readout, Role, Tone, Window};
+use angelica_sdk::{
+    api::runtime,
+    ui::{ActionKind, Dialog, Entry, Mark, Role, Tone, Window},
+};
 use library::Translation;
 
 impl Harmonia {
@@ -18,12 +21,11 @@ impl Harmonia {
         }
         if let Some(restart) = self.restart_line() {
             window = window.toned(restart, Tone::Warning);
-        }
-        if !self.started_with_game && !first_run {
+        } else if !self.started_with_game && !first_run {
             window = window.toned(
                 self.tr(
-                    "Harmonia was enabled after the game started; translations apply when the game starts.",
-                    "Harmonia включена после запуска игры; переводы применяются при запуске игры.",
+                    "Translations apply when the game starts.",
+                    "Перевод применяется при запуске игры.",
                 ),
                 Tone::Warning,
             );
@@ -45,22 +47,29 @@ impl Harmonia {
         window
     }
 
-    /// The state of the game in large text: the language, the rows
-    /// translated so far, and how well the translation matches this game
-    /// build.
-    fn hero(&self, mut window: Window) -> Window {
-        if self.yielded {
-            return window
-                .styled(
-                    self.tr("Harmonia in Dalamud", "Harmonia в Dalamud"),
-                    Role::Big,
-                    Tone::Normal,
-                )
-                .muted(self.tr(
-                    "Harmonia in Dalamud translated the game in the previous session, so this copy stays off in this one. It translates from the next start once Harmonia in Dalamud does not run, for example while Dalamud waits for an update after a game update.",
-                    "В прошлой игре перевод делала Harmonia в Dalamud, поэтому в этой игре эта копия выключена. Она начнёт переводить со следующего запуска, если Harmonia в Dalamud не запустится, например пока Dalamud ждёт обновления после обновления игры.",
-                ));
+    /// Compares the pack's target version with the running client.
+    fn pack_version_status(&self, pack_version: &str) -> (&'static str, Tone) {
+        let game_version = runtime::game_version();
+        if game_version.is_empty() {
+            (
+                self.tr("Game version unknown", "Версия игры неизвестна"),
+                Tone::Muted,
+            )
+        } else if game_version == pack_version {
+            (
+                self.tr("For this game version", "Для текущей версии игры"),
+                Tone::Muted,
+            )
+        } else {
+            (
+                self.tr("For a different game version", "Для другой версии игры"),
+                Tone::Warning,
+            )
         }
+    }
+
+    /// The language and translation in use.
+    fn hero(&self, window: Window) -> Window {
         let Some(applied) = self.applied.as_deref().and_then(|h| self.translation(h)) else {
             let game = language_name(crate::names::tag(self.game_language()), self.russian);
             return window
@@ -70,61 +79,20 @@ impl Harmonia {
                     Tone::Normal,
                 )
                 .muted(if self.russian {
-                    format!("В игре её язык: {game}")
+                    format!("Язык игры — {game}")
                 } else {
-                    format!("The game shows its own language: {game}")
+                    format!("Game language — {game}")
                 });
         };
-        window = window
+        let (version, tone) = self.pack_version_status(&applied.game_version);
+        window
             .styled(
                 language_name(&applied.language, self.russian),
                 Role::Big,
                 Tone::Normal,
             )
-            .muted(if self.russian {
-                format!("{} · версия {}", applied.title, applied.version)
-            } else {
-                format!("{} · version {}", applied.title, applied.version)
-            });
-        if let Some(status) = &self.status {
-            #[allow(clippy::cast_precision_loss)]
-            let taken = status.taken as f64;
-            window = window.row(|row| {
-                row.readout(Readout::new("taken", taken).role(Role::Title))
-                    .muted(self.tr("rows in the game", "строк в игре"))
-            });
-            let seen = status.taken + status.stale;
-            if seen > 0 {
-                #[allow(clippy::cast_precision_loss)]
-                let share = status.taken as f64 / seen as f64;
-                let percent = (share * 100.0).floor();
-                window = window.meter(Meter::new(share, 1.0).tone(Tone::Good).label(
-                    if self.russian {
-                        format!("{percent}% совпадает с этой версией игры")
-                    } else {
-                        format!("{percent}% matches this game build")
-                    },
-                ));
-            }
-        }
-        if let Some(summary) = &self.summary
-            && summary.kept_cells > 0
-        {
-            window = window.muted(if self.russian {
-                format!(
-                    "На языке игры: листов {}, ячеек {}",
-                    count(summary.kept_sheets as u64, true),
-                    count(summary.kept_cells as u64, true)
-                )
-            } else {
-                format!(
-                    "In the game's language: {} sheets, {} cells",
-                    count(summary.kept_sheets as u64, false),
-                    count(summary.kept_cells as u64, false)
-                )
-            });
-        }
-        window
+            .muted(format!("{} · {}", applied.title, applied.version))
+            .toned(version, tone)
     }
 
     /// No translation installed yet: the suggested one, then a field for a
@@ -140,8 +108,8 @@ impl Harmonia {
                 .value(megabytes(release.size))
                 .fact(self.tr("Version", "Версия"), &release.version)
                 .fact(
-                    self.tr("Made for the game", "Для игры"),
-                    &release.game_version,
+                    self.tr("Game version", "Версия игры"),
+                    self.pack_version_status(&release.game_version).0,
                 );
         }
         let busy = self.downloading.as_deref() == Some(SUGGESTED_FEED)
@@ -230,76 +198,6 @@ impl Harmonia {
         window
     }
 
-    /// When the feeds were checked last, in words.
-    fn checked_ago(&self) -> Option<String> {
-        let at = self.checked_at?;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let minutes = ((self.clock - at) / 60.0).floor() as u64;
-        Some(match (minutes, self.russian) {
-            (0, false) => "checked just now".to_owned(),
-            (0, true) => "проверено только что".to_owned(),
-            (m, false) => format!("checked {m} min ago"),
-            (m, true) => format!("проверено {m} мин назад"),
-        })
-    }
-
-    /// What the applied translation did in this session.
-    fn session_facts(&self, mut entry: Entry) -> Entry {
-        if let Some(status) = &self.status {
-            entry = entry.fact(
-                self.tr("Rows in the game", "Строк в игре"),
-                count(status.taken, self.russian),
-            );
-            entry = entry.fact(
-                self.tr(
-                    "Left as is: the game's text changed",
-                    "Пропущено: текст игры изменился",
-                ),
-                count(status.stale, self.russian),
-            );
-            if status.refused > 0 {
-                entry = entry.fact(
-                    self.tr("Left untouched", "Не тронуто"),
-                    if self.russian {
-                        format!("строк с неожиданным устройством: {}", status.refused)
-                    } else {
-                        format!("{} rows with an unexpected layout", status.refused)
-                    },
-                );
-            }
-            if !status.mismatched.is_empty() {
-                // Each is the sheet's name, a colon, and why.
-                let names: Vec<_> = status
-                    .mismatched
-                    .iter()
-                    .take(8)
-                    .map(|line| line.split(':').next().unwrap_or(line))
-                    .collect();
-                entry = entry.fact(
-                    self.tr(
-                        "Changed in this game build, in its language",
-                        "Изменились в этой версии игры, на её языке",
-                    ),
-                    format!("{} ({})", status.mismatched.len(), names.join(", ")),
-                );
-            }
-        }
-        if self.fonts > 0 {
-            entry = entry.fact(
-                self.tr("Fonts", "Шрифты"),
-                if self.russian {
-                    format!("файлов шрифтов игры с буквами перевода: {}", self.fonts)
-                } else {
-                    format!(
-                        "{} game font files with the translation's glyphs",
-                        self.fonts
-                    )
-                },
-            );
-        }
-        entry
-    }
-
     /// An installed translation as a row: its language and title, where it
     /// stands, and under the pointer Use; the chosen one shows what it is.
     #[allow(clippy::too_many_lines)]
@@ -370,59 +268,91 @@ impl Harmonia {
         if !chosen {
             return entry;
         }
-        entry = entry
+        if !applied {
+            entry = entry.fact(
+                self.tr("Game version", "Версия игры"),
+                self.pack_version_status(&translation.game_version).0,
+            );
+        }
+        if !translation.team.is_empty() {
+            entry = entry.fact(self.tr("Team", "Команда"), &translation.team);
+        }
+        if let Some(url) = &translation.feed
+            && let Some((_, view)) = self.feeds.iter().find(|(feed, _)| feed == url)
+            && let FeedStatus::Problem(reason) = &view.status
+        {
+            entry = entry.fact(self.tr("Update error", "Ошибка обновления"), reason);
+        }
+        let entry = self.pack_diagnostics(entry, translation);
+        self.translation_actions(entry, index, translation)
+    }
+
+    fn pack_diagnostics(&self, entry: Entry, translation: &Translation) -> Entry {
+        let mut entry = entry
             .fact(
-                self.tr("Version", "Версия"),
-                if self.russian {
-                    format!(
-                        "{}, для игры {}",
-                        translation.version, translation.game_version
-                    )
-                } else {
-                    format!(
-                        "{}, for the game {}",
-                        translation.version, translation.game_version
-                    )
-                },
+                self.tr("Target game version", "Версия игры для пака"),
+                &translation.game_version,
             )
-            .fact(self.tr("Team", "Команда"), &translation.team)
             .fact(
-                self.tr("Translated", "Переведено"),
-                if self.russian {
-                    format!("ячеек: {}", count(translation.cells as u64, true))
-                } else {
-                    format!("{} cells", count(translation.cells as u64, false))
-                },
+                self.tr("Pack contents", "Содержимое пака"),
+                self.sheet_counts(translation.sheets, translation.cells),
             )
             .fact(
-                self.tr("Author's key", "Ключ автора"),
+                self.tr("Publisher key", "Ключ издателя"),
                 translation
                     .key
                     .as_deref()
-                    .map_or_else(|| self.tr("not signed", "без подписи").to_owned(), short),
-            )
-            .fact(
-                self.tr("Updates", "Обновления"),
-                translation.feed.as_deref().map_or_else(
-                    || self.tr("from a file", "из файла").to_owned(),
-                    |url| {
-                        let how = if self.settings.auto_install {
-                            self.tr("install by themselves", "ставятся сами")
-                        } else {
-                            self.tr("on your word", "по вашему слову")
-                        };
-                        let mut text = format!("{how}; {}", self.feed_state(url).0);
-                        if let Some(ago) = self.checked_ago() {
-                            text = format!("{text} ({ago})");
-                        }
-                        text
-                    },
-                ),
+                    .map_or_else(|| self.tr("Unsigned", "Без подписи").to_owned(), short),
             );
-        if applied {
-            entry = self.session_facts(entry);
+        if self.applied.as_deref() != Some(translation.hash.as_str()) {
+            return entry;
         }
-        self.translation_actions(entry, index, translation)
+        if let Some(status) = &self.status {
+            entry = entry
+                .fact(
+                    self.tr("Applied replacements", "Применено замен"),
+                    count(status.taken, self.russian),
+                )
+                .fact(
+                    self.tr(
+                        "Skipped because the original changed",
+                        "Пропущено из-за изменений оригинала",
+                    ),
+                    count(status.stale, self.russian),
+                )
+                .fact(
+                    self.tr(
+                        "Rows with an unexpected layout",
+                        "Строки с неизвестной структурой",
+                    ),
+                    count(status.refused, self.russian),
+                );
+            if !status.mismatched.is_empty() {
+                let names: Vec<_> = status
+                    .mismatched
+                    .iter()
+                    .take(8)
+                    .map(|line| line.split(':').next().unwrap_or(line))
+                    .collect();
+                entry = entry.fact(
+                    self.tr(
+                        "Sheets with a different layout",
+                        "Листы с изменившейся структурой",
+                    ),
+                    format!("{} ({})", status.mismatched.len(), names.join(", ")),
+                );
+            }
+        }
+        if let Some(summary) = &self.summary {
+            entry = entry.fact(
+                self.tr("Kept in the game's language", "Оставлено на языке игры"),
+                self.sheet_counts(summary.kept_sheets, summary.kept_cells),
+            );
+        }
+        entry.fact(
+            self.tr("Replaced font files", "Подменено файлов шрифтов"),
+            count(self.fonts as u64, self.russian),
+        )
     }
 
     fn feed_position(&self, translation: &Translation) -> Option<usize> {
@@ -517,7 +447,12 @@ impl Harmonia {
                             .action(format!("feed-get-{index}"), self.tr("Download", "Скачать"));
                     }
                     if chosen {
-                        entry = entry.fact(self.tr("Version", "Версия"), &release.version);
+                        entry = entry
+                            .fact(self.tr("Version", "Версия"), &release.version)
+                            .fact(
+                                self.tr("Game version", "Версия игры"),
+                                self.pack_version_status(&release.game_version).0,
+                            );
                     }
                 }
                 Some(FeedStatus::Problem(reason)) => {
@@ -584,9 +519,12 @@ impl Harmonia {
         }
         for (index, (path, size)) in self.imports.iter().enumerate() {
             let name = path.rsplit('/').next().unwrap_or(path);
-            let mut entry = Entry::new(format!("row-i{index}"), name)
-                .plain()
-                .value(megabytes(*size));
+            let id = format!("row-i{index}");
+            let chosen = self.chosen.as_deref() == Some(&id);
+            let mut entry = Entry::new(id, name).plain().chosen(chosen);
+            if chosen {
+                entry = entry.fact(self.tr("Size", "Размер"), megabytes(*size));
+            }
             if self.job.is_none() {
                 entry = entry.action(format!("check-{index}"), self.tr("Check", "Проверить"));
             }
@@ -609,10 +547,6 @@ impl Harmonia {
                         true,
                     )
                     .spacer();
-                let row = match self.checked_ago() {
-                    Some(ago) if !self.settings.feeds.is_empty() => row.muted(ago),
-                    _ => row,
-                };
                 if self.settings.feeds.is_empty() {
                     row
                 } else {
@@ -710,6 +644,7 @@ impl Harmonia {
     /// The question whether to install the pack that was checked.
     fn inspection_dialog(&self, inspection: &Inspection) -> Dialog {
         let translation = &inspection.translation;
+        let (version, tone) = self.pack_version_status(&translation.game_version);
         let dialog = Dialog::new(
             "install",
             self.tr("Install this translation?", "Установить перевод?"),
@@ -724,24 +659,7 @@ impl Harmonia {
             self.tr("Language", "Язык"),
             format!("{} ← {}", translation.language, translation.game_language),
         )
-        .fact(
-            self.tr("Translated", "Переведено"),
-            if self.russian {
-                format!(
-                    "ячеек: {}, листов: {}",
-                    translation.cells, translation.sheets
-                )
-            } else {
-                format!(
-                    "{} cells in {} sheets",
-                    translation.cells, translation.sheets
-                )
-            },
-        )
-        .fact(
-            self.tr("Made for the game", "Сделан для игры"),
-            &translation.game_version,
-        );
+        .toned(version, tone);
         let dialog = match &translation.key {
             Some(key) => dialog
                 .fact(

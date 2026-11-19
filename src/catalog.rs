@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// The longest sample kept, in characters.
 const SAMPLE: usize = 90;
+const CATALOG_REVISION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sample {
@@ -64,6 +65,8 @@ pub fn path(hash: &str) -> String {
 struct Header {
     hash: String,
     game_version: String,
+    #[serde(default)]
+    revision: u8,
 }
 
 /// Every other line: a sheet or a quest.
@@ -92,6 +95,9 @@ impl Loader {
         let text = String::from_utf8(bytes).ok()?;
         let end = text.find('\n').unwrap_or(text.len());
         let header: Header = serde_json::from_str(&text[..end]).ok()?;
+        if header.revision != CATALOG_REVISION {
+            return None;
+        }
         Some(Self {
             catalog: Catalog {
                 hash: header.hash,
@@ -155,6 +161,7 @@ impl Catalog {
         let mut text = serde_json::to_string(&Header {
             hash: self.hash.clone(),
             game_version: self.game_version.clone(),
+            revision: CATALOG_REVISION,
         })
         .map_err(|e| e.to_string())?;
         let sheets = self.sheets.iter().cloned().map(Line::Sheet);
@@ -239,7 +246,20 @@ impl Catalog {
             return (Vec::new(), 0);
         }
         let mut found: Vec<(u8, String)> = Vec::new();
-        let mut folders: Vec<String> = Vec::new();
+        let mut folders = std::collections::BTreeSet::new();
+        let quests: std::collections::HashMap<_, _> = self
+            .quests
+            .iter()
+            .map(|quest| {
+                (
+                    quest.id.as_str(),
+                    (
+                        crate::names::normalize(&quest.original),
+                        crate::names::normalize(&quest.shown),
+                    ),
+                )
+            })
+            .collect();
         for sheet in &self.sheets {
             let name = sheet.name.to_ascii_lowercase();
             let mut parts: Vec<&str> = sheet.name.split('/').collect();
@@ -249,8 +269,8 @@ impl Catalog {
                 prefix.push_str(part);
                 prefix.push('/');
                 let folder = format!("{prefix}*");
-                if prefix.to_ascii_lowercase().contains(&query) && !folders.contains(&folder) {
-                    folders.push(folder);
+                if prefix.to_ascii_lowercase().contains(&query) {
+                    folders.insert(folder);
                 }
             }
             let rank = if name == query {
@@ -264,10 +284,15 @@ impl Catalog {
                 2
             } else if crate::names::normalize(&sheet.name).contains(&query) {
                 3
-            } else if self.quest(&sheet.name).is_some_and(|quest| {
-                crate::names::normalize(&quest.original).contains(&query)
-                    || crate::names::normalize(&quest.shown).contains(&query)
-            }) {
+            } else if sheet
+                .name
+                .strip_prefix("quest/")
+                .and_then(|s| s.rsplit('/').next())
+                .and_then(|id| quests.get(id))
+                .is_some_and(|(original, shown)| {
+                    original.contains(&query) || shown.contains(&query)
+                })
+            {
                 4
             } else {
                 continue;
@@ -381,7 +406,7 @@ pub fn build(hash: &str) -> Result<Catalog, String> {
 }
 
 /// The names of the quests `ids`, original and as the translation shows
-/// them; none when the map does not name the Quest sheet's `id` and `name`.
+/// them; none when the map does not name the Quest sheet's identifier and name.
 fn quests(pack: &crate::pack::Pack<'_>, language: u8, ids: &[String]) -> Vec<Quest> {
     use angelica_sdk::excel;
     let Ok(info) = excel::sheet("Quest") else {
@@ -390,9 +415,12 @@ fn quests(pack: &crate::pack::Pack<'_>, language: u8, ids: &[String]) -> Vec<Que
     let Some(name) = info.fields.iter().find(|f| f.name == "name") else {
         return Vec::new();
     };
-    if !info.fields.iter().any(|f| f.name == "id") {
+    let Some(identifier) = ["identifier", "id"]
+        .into_iter()
+        .find(|column| info.fields.iter().any(|field| field.name == *column))
+    else {
         return Vec::new();
-    }
+    };
     let mut translated = std::collections::HashMap::new();
     if let Some(sheet) = pack.sheets().find(|sheet| sheet.name == "Quest") {
         for cell in sheet.cells() {
@@ -403,7 +431,7 @@ fn quests(pack: &crate::pack::Pack<'_>, language: u8, ids: &[String]) -> Vec<Que
     }
     let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
     let mut quests = Vec::new();
-    for row in excel::rows("Quest", language, &["id", "name"]).flatten() {
+    for row in excel::rows("Quest", language, &[identifier, "name"]).flatten() {
         let id = row.values[0].plain().unwrap_or_default();
         if !wanted.contains(id.as_str()) {
             continue;

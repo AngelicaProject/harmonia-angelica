@@ -144,14 +144,6 @@ impl Harmonia {
                 true,
             );
         }
-        if name.wearable {
-            entry = entry.more(
-                format!("try-{id}"),
-                self.tr("Try on", "Примерить"),
-                ActionKind::Quiet,
-                true,
-            );
-        }
         if !name.english.is_empty() {
             entry = entry.more(
                 format!("wiki-c-{id}"),
@@ -333,11 +325,6 @@ impl Harmonia {
                 };
                 Self::copy(&text);
                 self.dictionary.copied = Some(key);
-            }
-            return true;
-        } else if let Some(key) = id.strip_prefix("try-").and_then(key) {
-            if let Err(error) = angelica_sdk::lens::act("try_on", &[("item", key.1.into())]) {
-                angelica_sdk::warning(&format!("Cannot try on: {}", error.message));
             }
             return true;
         } else if let Some(rest) = id
