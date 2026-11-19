@@ -568,12 +568,12 @@ fn a_pack_with_fonts_replaces_the_games_font_files_at_the_next_start() {
     let folder = test.folder;
     let mut test = TestHost::in_folder(folder, Limits::default());
     start(&mut test);
-    choose_tab(&test, 3);
+    click(&test, "row-t0");
     let plugin = test.host.plugin("harmonia").unwrap();
     assert!(plugin.windows()[0].widgets.iter().any(|widget| matches!(
         widget,
-        Widget::Fact(fact)
-            if fact.name == "Replaced font files" && fact.value.parse::<u64>().is_ok_and(|n| n > 0)
+        Widget::Entry(entry) if entry.id == "row-t0" && entry.facts.iter().any(|fact|
+            fact.name == "Replaced font files" && fact.value.parse::<u64>().is_ok_and(|n| n > 0))
     )));
     let target = harmonia::pack::Pack::parse(&pack)
         .unwrap()
